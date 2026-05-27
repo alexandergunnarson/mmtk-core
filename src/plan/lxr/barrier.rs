@@ -120,6 +120,20 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         slot: VM::VMSlot,
         _new: Option<ObjectReference>,
     ) -> bool {
+        // Guard: skip slots whose addresses are outside the MMTk heap.
+        // Side metadata (unlog bits) is only mapped for addresses in the
+        // managed heap range.  Slots in malloc'd memory (e.g. external
+        // GenericMemory data buffers with how==1/2) have no metadata and
+        // would SIGSEGV on load.  This can happen when object_probable_write
+        // scans all fields of an object whose GenericMemory data is external.
+        {
+            use crate::util::heap::layout::vm_layout::vm_layout;
+            let slot_addr = slot.to_address();
+            let layout = vm_layout();
+            if slot_addr < layout.heap_start || slot_addr >= layout.heap_end {
+                return false;
+            }
+        }
         if TAKERATE_MEASUREMENT && self.mmtk.inside_harness() {
             FAST_COUNT.fetch_add(1, Ordering::SeqCst);
         }
