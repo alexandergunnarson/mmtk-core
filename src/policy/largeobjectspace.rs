@@ -401,7 +401,13 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         let mut mature_blocks = self.rc_mature_objects.lock().unwrap();
         while let Some(o) = self.rc_nursery_objects.pop() {
             if self.rc.count(o) == 0 {
-                self.release_object(o.to_raw_address());
+                // Page-align the address before releasing — the free list
+                // tracks pages, not object addresses. LOS objects have a
+                // header (bigval_t) that offsets them from the page start.
+                // Without alignment, free_list.size() returns garbage.
+                // (cf. sweep_large_pages which uses get_super_page)
+                let page = get_super_page(o.to_object_start::<VM>());
+                self.release_object(page);
             } else {
                 mature_blocks.insert(o, o.get_size::<VM>());
             }
@@ -567,7 +573,8 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     pub fn rc_free(&self, o: ObjectReference) {
         let mut rc_mature_objects = self.rc_mature_objects.lock().unwrap();
         if rc_mature_objects.remove(&o).is_some() {
-            let pages = self.release_object(o.to_raw_address());
+            let page = get_super_page(o.to_object_start::<VM>());
+            let pages = self.release_object(page);
             self.num_pages_released_lazy
                 .fetch_add(pages, Ordering::Relaxed);
         }
@@ -650,7 +657,8 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             if !is_live(*o) {
                 self.update_stat_for_dead_mature_object(*o);
                 self.rc.set(*o, 0);
-                let pages = self.release_object(o.to_raw_address());
+                let page = get_super_page(o.to_object_start::<VM>());
+                let pages = self.release_object(page);
                 self.num_pages_released_lazy
                     .fetch_add(pages, Ordering::Relaxed);
                 released_objects.push(*o);

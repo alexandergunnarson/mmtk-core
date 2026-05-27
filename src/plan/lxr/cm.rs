@@ -570,6 +570,10 @@ impl<VM: VMBinding, const FULL_GC: bool> LXRStopTheWorldProcessEdges<VM, FULL_GC
         if REMSET && (!object.is_in_any_space() || !object.to_raw_address().is_aligned_to(8)) {
             return object;
         }
+        // Guard: skip objects not in Immix/LOS — they have no RC_TABLE metadata
+        if !super::rc::has_rc_metadata(object, self.lxr) {
+            return object;
+        }
         if self.lxr.rc.count(object) == 0 {
             return object;
         }

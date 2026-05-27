@@ -135,6 +135,18 @@ impl<VM: VMBinding> Space<VM> for VMSpace<VM> {
         }
     }
 
+
+    /// Override the default verify_side_metadata_sanity to use VMSpace's own metadata
+    /// context instead of the ExternalPageResource's (which has empty global specs).
+    /// This is needed because ExternalPageResource::new initializes with empty
+    /// SideMetadataContext, but VMSpace stores the correct metadata separately.
+    fn verify_side_metadata_sanity(&self, side_metadata_sanity_checker: &mut crate::util::metadata::side_metadata::SideMetadataSanity) {
+        side_metadata_sanity_checker.verify_metadata_context(
+            std::any::type_name::<Self>(),
+            &self.metadata,
+        )
+    }
+
     fn release_multiple_pages(&mut self, _start: Address) {
         unreachable!()
     }

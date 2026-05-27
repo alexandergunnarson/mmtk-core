@@ -357,8 +357,14 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
             let common = self.common();
             common.get_vm_map32().get_descriptor_for_address(start) == common.descriptor
         } else {
-            debug_assert!(self.common().descriptor.is_contiguous());
-            start >= self.common().start && start < self.common().start + self.common().extent
+            let common = self.common();
+            if common.descriptor.is_contiguous() {
+                // Contiguous space: fast range check
+                start >= common.start && start < common.start + common.extent
+            } else {
+                // Discontiguous space: chunk-based descriptor lookup (O(1))
+                common.vm_map.get_descriptor_for_address(start) == common.descriptor
+            }
         }
     }
 

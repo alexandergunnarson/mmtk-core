@@ -196,7 +196,7 @@ fn disable_lasy_dec_for_current_gc() -> bool {
 
 #[derive(Debug)]
 #[repr(C)]
-pub(crate) struct Timer(UnsafeCell<Option<Instant>>);
+pub struct Timer(UnsafeCell<Option<Instant>>);
 
 impl Timer {
     const fn new() -> Self {
@@ -227,8 +227,8 @@ impl Deref for Timer {
     }
 }
 
-static GC_TRIGGER_TIME: Timer = Timer::new();
-static GC_START_TIME: Timer = Timer::new();
+pub static GC_TRIGGER_TIME: Timer = Timer::new();
+pub static GC_START_TIME: Timer = Timer::new();
 static BOOT_TIME: spin::Lazy<SystemTime> = spin::Lazy::new(SystemTime::now);
 static GC_EPOCH: AtomicUsize = AtomicUsize::new(0);
 static RESERVED_PAGES_AT_GC_START: AtomicUsize = AtomicUsize::new(0);

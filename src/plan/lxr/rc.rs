@@ -27,6 +27,17 @@ use atomic::Ordering;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+/// Check whether an object resides in a space that has RC_TABLE side metadata
+/// mapped (Immix or LOS).  Objects in other spaces (VM space, immortal, non-moving)
+/// do not have RC metadata and must be skipped by all RC operations.
+#[inline]
+pub(super) fn has_rc_metadata<VM: VMBinding>(o: ObjectReference, lxr: &LXR<VM>) -> bool {
+    // Positive filter: only Immix and LOS have RC_TABLE metadata.
+    // With the fix to address_in_space() for discontiguous spaces, in_space()
+    // is now precise (uses chunk-based descriptor lookup, not range check).
+    lxr.immix_space.in_space(o) || lxr.los().in_space(o)
+}
+
 #[inline]
 fn prefetch_object<VM: VMBinding>(o: ObjectReference, rc: &RefCountHelper<VM>) {
     if crate::args::PREFETCH_HEADER {
@@ -256,6 +267,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     slot,
                     target
                 );
+                // Guard: skip RC ops for objects not in Immix/LOS (no RC_TABLE metadata)
+                if !self.object_has_rc_metadata(target) {
+                    return;
+                }
                 let rc = self.rc.count(target);
                 if rc == 0 {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
@@ -309,8 +324,22 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         false
     }
 
+    /// Check whether an object resides in a space that has RC_TABLE side metadata.
+    #[inline]
+    fn object_has_rc_metadata(&self, o: ObjectReference) -> bool {
+        has_rc_metadata(o, self.lxr)
+    }
+
     fn process_inc_and_evacuate(&mut self, o: ObjectReference, depth: u32) -> ObjectReference {
         o.verify::<VM>();
+        // Guard: skip RC operations for objects not in Immix or LOS space.
+        // RC_TABLE side metadata is only mapped for Immix and LOS.  Objects in
+        // VM space (sysimage), immortal space, or non-moving space would SIGSEGV
+        // on any RC_TABLE access (inc/dec/count).  These objects have permanent
+        // lifetimes and don't need reference counting.
+        if !self.object_has_rc_metadata(o) {
+            return o;
+        }
         crate::stat(|s| {
             s.inc_objects += 1;
             s.inc_volume += o.get_size::<VM>();
@@ -790,9 +819,12 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 if let Some(x) = slot.load() {
                     // println!(" -- rec dec {:?}.{:?} -> {:?}", o, slot, x);
                     if !out_of_heap {
-                        let rc = self.rc.count(x);
-                        if rc != MAX_REF_COUNT && rc != 0 {
-                            self.recursive_dec(x);
+                        // Guard: skip RC ops for objects not in Immix/LOS (no RC_TABLE metadata)
+                        if has_rc_metadata(x, lxr) {
+                            let rc = self.rc.count(x);
+                            if rc != MAX_REF_COUNT && rc != 0 {
+                                self.recursive_dec(x);
+                            }
                         }
                     } else {
                         self.record_mature_evac_remset(lxr, slot, x);
@@ -839,10 +871,10 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     fn process_decs(&mut self, decs: &[ObjectReference], lxr: &LXR<VM>) {
         for (i, o) in decs.iter().enumerate() {
-            // println!("dec {:?}", o);
-            // if o.is_null() {
-            //     continue;
-            // }
+            // Guard: skip objects not in Immix/LOS — they have no RC_TABLE metadata
+            if !has_rc_metadata(*o, lxr) {
+                continue;
+            }
             if self.rc.is_dead_or_stuck(*o)
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
