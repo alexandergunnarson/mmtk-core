@@ -359,6 +359,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 // MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
                 MetadataSpec::OnSide(Block::MARK_TABLE),
                 *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC,
+                // Forwarding bits are required for is_forwarded_or_being_forwarded
+                // checks during nursery evacuation and Full GC tracing.
+                // Without this, the metadata pages are never mapped, and any
+                // access during GC crashes with SIGSEGV.
+                // NOTE: LOCAL_FORWARDING_POINTER_SPEC is in_header(-64) for Julia
+                // (not side metadata), so it doesn't need to be in this list.
+                // LOCAL_PINNING_BIT_SPEC is also omitted: pinning is handled via
+                // has_rc_metadata() guards, not via metadata page mapping.
+                *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC,
                 MetadataSpec::OnSide(crate::util::rc::RC_STRADDLE_LINES),
                 MetadataSpec::OnSide(Block::LOG_TABLE),
                 MetadataSpec::OnSide(Block::NURSERY_PROMOTION_STATE_TABLE),

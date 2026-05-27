@@ -358,11 +358,21 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
             common.get_vm_map32().get_descriptor_for_address(start) == common.descriptor
         } else {
             let common = self.common();
+            // Two-stage check: fast negative filter + precise positive confirmation.
+            //
+            // Stage 1 (no memory load): contiguous range check eliminates objects
+            // clearly outside this space's virtual range.  This is the common case
+            // for VM-space, immortal-space, and other-space objects.
+            //
+            // Stage 2 (one memory load): for addresses WITHIN the virtual range,
+            // confirm with chunk-based descriptor lookup.  The range check alone is
+            // unsound because the virtual reservation can encompass addresses
+            // belonging to other spaces (e.g., immortal space mapped within the
+            // Immix range).  The chunk-based lookup is O(1) and precise.
             if common.descriptor.is_contiguous() {
-                // Contiguous space: fast range check
                 start >= common.start && start < common.start + common.extent
+                    && common.vm_map.get_descriptor_for_address(start) == common.descriptor
             } else {
-                // Discontiguous space: chunk-based descriptor lookup (O(1))
                 common.vm_map.get_descriptor_for_address(start) == common.descriptor
             }
         }
