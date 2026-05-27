@@ -1,3 +1,4 @@
+use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::mmtk::SFT_MAP;
 use crate::plan::{ObjectQueue, VectorObjectQueue};
 use crate::policy::sft::GCWorkerMutRef;
@@ -27,6 +28,7 @@ pub struct VMSpace<VM: VMBinding> {
     mark_state: MarkState,
     common: CommonSpace<VM>,
     pr: ExternalPageResource<VM>,
+    metadata: SideMetadataContext,
 }
 
 impl<VM: VMBinding> SFT for VMSpace<VM> {
@@ -58,7 +60,7 @@ impl<VM: VMBinding> SFT for VMSpace<VM> {
     fn is_sane(&self) -> bool {
         true
     }
-    fn initialize_object_metadata(&self, object: ObjectReference) {
+    fn initialize_object_metadata(&self, object: ObjectReference, _bytes: usize) {
         self.mark_state
             .on_object_metadata_initialization::<VM>(object);
         if self.common.unlog_allocated_object {
@@ -194,16 +196,22 @@ impl<VM: VMBinding> VMSpace<VM> {
     pub fn new(args: crate::policy::space::PlanCreateSpaceArgs<VM>) -> Self {
         let (vm_space_start, vm_space_size) =
             (*args.options.vm_space_start, *args.options.vm_space_size);
+        let local_specs = crate::util::metadata::extract_side_metadata(&[
+            *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC,
+        ]);
+        let metadata = SideMetadataContext {
+            global: args.global_side_metadata_specs.clone(),
+            local: local_specs.clone(),
+        };
         let space = Self {
             mark_state: MarkState::new(),
             pr: ExternalPageResource::new(args.vm_map),
             common: CommonSpace::new(args.into_policy_args(
                 false,
                 true,
-                crate::util::metadata::extract_side_metadata(&[
-                    *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC,
-                ]),
+                local_specs,
             )),
+            metadata,
         };
 
         if !vm_space_start.is_zero() {
@@ -244,8 +252,7 @@ impl<VM: VMBinding> VMSpace<VM> {
         // Mark as mapped in mmapper
         self.common.mmapper.mark_as_mapped(chunk_start, chunk_size);
         // Map side metadata
-        self.common
-            .metadata
+        self.metadata
             .try_map_metadata_space(chunk_start, chunk_size, self.get_name())
             .unwrap();
         // Insert to vm map: it would be good if we can make VM map aware of the region. However, the region may be outside what we can map in our VM map implementation.

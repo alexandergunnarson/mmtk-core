@@ -11,6 +11,7 @@ mod heap_meta;
 pub(crate) mod monotonepageresource;
 pub(crate) mod pageresource;
 pub(crate) mod regionpageresource;
+pub(crate) mod externalpageresource;
 pub(crate) mod space_descriptor;
 mod vmrequest;
 

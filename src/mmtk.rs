@@ -594,7 +594,7 @@ impl<VM: VMBinding> MMTK<VM> {
         self.get_plan()
             .base()
             .vm_space
-            .initialize_object_metadata(object)
+            .initialize_object_metadata(object, 0)
     }
 }
 

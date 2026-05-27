@@ -5,8 +5,9 @@ use crate::util::address::Address;
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::constants::LOG_BYTES_IN_PAGE;
 use crate::util::heap::pageresource::CommonPageResource;
-use crate::util::heap::space_descriptor::SpaceDescriptor;
+use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::opaque_pointer::*;
+use crate::policy::space::Space;
 use crate::vm::VMBinding;
 
 use std::marker::PhantomData;
@@ -49,7 +50,7 @@ impl<VM: VMBinding> PageResource<VM> for ExternalPageResource<VM> {
 
     fn alloc_pages(
         &self,
-        _space_descriptor: SpaceDescriptor,
+        _space: &dyn Space<VM>,
         _reserved_pages: usize,
         _required_pages: usize,
         _tls: VMThread,
@@ -61,7 +62,10 @@ impl<VM: VMBinding> PageResource<VM> for ExternalPageResource<VM> {
 impl<VM: VMBinding> ExternalPageResource<VM> {
     pub fn new(vm_map: &'static dyn VMMap) -> Self {
         Self {
-            common: CommonPageResource::new(false, false, vm_map),
+            common: CommonPageResource::new(false, false, vm_map, SideMetadataContext {
+                global: vec![],
+                local: vec![],
+            }),
             ranges: Mutex::new(vec![]),
             _p: PhantomData,
         }
