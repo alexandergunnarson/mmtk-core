@@ -138,6 +138,34 @@ pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
     ///
     // TODO: Review any potential use cases for other VM bindings.
     fn object_probable_write(&mut self, _obj: ObjectReference) {}
+
+    /// Post-successful-cmpswap barrier with explicit old value.
+    ///
+    /// Called AFTER a successful atomic compare-and-swap on a pointer field.
+    /// Unlike `object_reference_write_pre`, this does NOT read the old value
+    /// from the slot (which now contains the new value after the cmpswap).
+    /// Instead, the caller provides the old value explicitly (from the
+    /// cmpswap's `expected` parameter, which is unchanged on success).
+    ///
+    /// This is critical for reference-counting collectors (LXR): a pre-write
+    /// barrier fired BEFORE a cmpswap that FAILS would spuriously decrement
+    /// the current value's RC on each retry iteration.  This post-cmpswap
+    /// variant fires only on success, with the correct old value.
+    ///
+    /// Arguments:
+    /// *   `src`: The parent GC object containing the field.
+    /// *   `slot`: The field address that was written by the cmpswap.
+    /// *   `old`: The old value that was in the slot before the cmpswap
+    ///            (may be None if the slot was NULL).
+    /// *   `new`: The new value now in the slot after the cmpswap.
+    fn object_reference_write_post_cmpswap(
+        &mut self,
+        _src: ObjectReference,
+        _slot: VM::VMSlot,
+        _old: Option<ObjectReference>,
+        _new: Option<ObjectReference>,
+    ) {
+    }
 }
 
 impl_downcast!(Barrier<VM> where VM: VMBinding);
@@ -186,6 +214,23 @@ pub trait BarrierSemantics: 'static + Send {
 
     /// Loading from a weak reference field
     fn load_weak_reference(&mut self, _o: ObjectReference) {}
+
+    /// Post-successful-cmpswap barrier with explicit old value.
+    ///
+    /// Called AFTER a successful atomic compare-and-swap on a pointer field.
+    /// The caller provides the old value explicitly (from the cmpswap's
+    /// `expected` parameter) rather than reading it from the slot (which
+    /// now contains the new value).
+    ///
+    /// Default: no-op.  LXR overrides this to push old → decs, slot → incs.
+    fn object_reference_write_post_cmpswap(
+        &mut self,
+        _src: ObjectReference,
+        _slot: <Self::VM as VMBinding>::VMSlot,
+        _old: Option<ObjectReference>,
+        _new: Option<ObjectReference>,
+    ) {
+    }
 }
 
 /// Generic object barrier with a type argument defining it's slow-path behaviour.
@@ -320,6 +365,17 @@ impl<S: BarrierSemantics> Barrier<S::VM> for FieldBarrier<S> {
         _target: Option<ObjectReference>,
     ) {
         unimplemented!()
+    }
+
+    fn object_reference_write_post_cmpswap(
+        &mut self,
+        src: ObjectReference,
+        slot: <S::VM as VMBinding>::VMSlot,
+        old: Option<ObjectReference>,
+        new: Option<ObjectReference>,
+    ) {
+        self.semantics
+            .object_reference_write_post_cmpswap(src, slot, old, new);
     }
 
     fn object_reference_write_slow(

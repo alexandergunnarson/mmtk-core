@@ -73,7 +73,12 @@ impl<VM: VMBinding> EvacuateMatureObjects<VM> {
         // Skip objects that are dead or out of the collection set.
         let v = unsafe { s.to_address().load::<u32>() };
         if v & 0b111 != 0 {
-            panic!("Invalid slot: {s:?} -> {v:#x}");
+            // Stale remset entry: the slot value is not pointer-aligned,
+            // meaning it was overwritten with a non-pointer value (isbits
+            // field, tag, etc.) after the remset recorded it.  This is
+            // expected when Julia's write barrier fires on a field that
+            // is later reused for non-pointer data.  Skip silently.
+            return false;
         }
         let Some(o) = s.load() else {
             return false;

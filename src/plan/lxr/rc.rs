@@ -25,7 +25,15 @@ use crate::{
 };
 use atomic::Ordering;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+
+/// RC death diagnostic: how many dying objects to log before suppressing.
+const DEATH_LOG_LIMIT: usize = 500;
+/// RC death diagnostic: atomic counter of dying objects logged so far.
+static DEATH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// RC death diagnostic: which GC cycle we are in (incremented in ProcessDecs::do_work).
+static GC_CYCLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Check whether an object resides in a space that has RC_TABLE side metadata
 /// mapped (Immix or LOS).  Objects in other spaces (VM space, immortal, non-moving)
@@ -420,9 +428,21 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     ) -> Option<ObjectReference> {
         debug_assert!(!crate::args::EAGER_INCREMENTS);
         let o = s.load();
-        // unlog slot
+        // unlog slot — but only if the slot address is in the MMTk managed
+        // heap.  Non-heap slots (e.g. external GenericMemory data buffers
+        // allocated via malloc, with how==1/2) have no side metadata (unlog
+        // bits) mapped.  Calling unlog_field_relaxed on such addresses would
+        // SIGSEGV.  These slots are enqueued by the non-heap path in
+        // enqueue_node (barrier.rs) and are safe to read (the malloc'd
+        // buffer remains valid as long as the owning GenericMemory is alive),
+        // but must not have their unlog bits touched.
         if K == EDGE_KIND_MATURE {
-            s.to_address().unlog_field_relaxed::<VM>();
+            use crate::util::heap::layout::vm_layout::vm_layout;
+            let slot_addr = s.to_address();
+            let layout = vm_layout();
+            if slot_addr >= layout.heap_start && slot_addr < layout.heap_end {
+                slot_addr.unlog_field_relaxed::<VM>();
+            }
         }
         o
     }
@@ -792,6 +812,109 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     #[cold]
     fn process_dead_object(&mut self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        // === RC death diagnostic instrumentation ===
+        // Log vtag, address, size, space, and GC cycle for the first DEATH_LOG_LIMIT dying objects.
+        // The vtag is at object_address - 8 (Julia's tag word preceding the object).
+        // For Julia objects:
+        //   - Small type tags (< 0x100): shifted tag value (e.g., 0x50 = simplevector, 0x90 = svec, 0xa0 = genericmemory)
+        //   - Large values: pointer to jl_datatype_t
+        //
+        // For BindingPartition objects (vtag = jl_binding_partition_type), also log:
+        //   - restriction field (offset +0):  the value/binding this partition resolves to
+        //   - kind field       (offset +8):  partition kind flags
+        //   - min_world        (offset +16): _Atomic min world age
+        //   - max_world        (offset +24): _Atomic max world age
+        //   - next             (offset +32): _Atomic pointer to next partition in linked list
+        // This helps diagnose whether the partition was orphaned (next != NULL but
+        // nothing points to it) or whether the parent Binding's partitions field was
+        // overwritten without a barrier.
+        {
+            let n = DEATH_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let gc_cycle = GC_CYCLE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            if n < DEATH_LOG_LIMIT {
+                let obj_addr = o.to_raw_address();
+                let in_immix = lxr.immix_space.in_space(o);
+                let in_los = lxr.los().in_space(o);
+                let space = if in_immix {
+                    "immix"
+                } else if in_los {
+                    "LOS"
+                } else {
+                    "???"
+                };
+                // Read vtag at obj - 8 (Julia header word)
+                let vtag_addr = obj_addr - 8usize;
+                let vtag: usize = if vtag_addr.is_mapped() {
+                    unsafe { vtag_addr.load::<usize>() }
+                } else {
+                    0xDEAD
+                };
+                let size = if obj_addr.is_mapped() {
+                    o.get_size::<VM>()
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[rc-death #{:>4} gc={}] addr={:#x} vtag={:#x} size={} space={}",
+                    n, gc_cycle, obj_addr, vtag, size, space
+                );
+                // For 48-byte objects (likely BindingPartition), dump pointer fields
+                // to help trace the ownership chain.
+                // BindingPartition layout (Julia 1.12, from julia.h):
+                //   +0:  restriction (jl_value_t*)
+                //   +8:  min_world (_Atomic size_t)
+                //   +16: max_world (_Atomic size_t)
+                //   +24: next (_Atomic jl_binding_partition_t*)
+                //   +32: kind (size_t)
+                if size == 48 && obj_addr.is_mapped() {
+                    let restriction: usize = unsafe { obj_addr.load::<usize>() };
+                    let min_world: usize = unsafe { (obj_addr + 8usize).load::<usize>() };
+                    let max_world: usize = unsafe { (obj_addr + 16usize).load::<usize>() };
+                    let next: usize = unsafe { (obj_addr + 24usize).load::<usize>() };
+                    let kind: usize = unsafe { (obj_addr + 32usize).load::<usize>() };
+                    // Check if restriction or next point to objects with valid RC
+                    let restriction_rc = if restriction != 0 {
+                        let robj = unsafe {
+                            ObjectReference::from_raw_address_unchecked(
+                                crate::util::Address::from_usize(restriction),
+                            )
+                        };
+                        if has_rc_metadata(robj, lxr) {
+                            self.rc.count(robj) as isize
+                        } else {
+                            -1 // not in RC space
+                        }
+                    } else {
+                        -2 // NULL
+                    };
+                    let next_rc = if next != 0 {
+                        let nobj = unsafe {
+                            ObjectReference::from_raw_address_unchecked(
+                                crate::util::Address::from_usize(next),
+                            )
+                        };
+                        if has_rc_metadata(nobj, lxr) {
+                            self.rc.count(nobj) as isize
+                        } else {
+                            -1 // not in RC space
+                        }
+                    } else {
+                        -2 // NULL
+                    };
+                    eprintln!(
+                        "         restriction={:#x}(rc={}) kind={:#x} worlds=[{},{}] next={:#x}(rc={})",
+                        restriction, restriction_rc, kind, min_world, max_world, next, next_rc
+                    );
+                }
+            } else if n == DEATH_LOG_LIMIT {
+                eprintln!(
+                    "[rc-death] ... suppressing further death logs (limit={}) at gc={}",
+                    DEATH_LOG_LIMIT, gc_cycle
+                );
+            }
+        }
+        // === end diagnostic ===
+
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();
@@ -810,7 +933,6 @@ impl<VM: VMBinding> ProcessDecs<VM> {
         if self.mark_dead_objects {
             lxr.mark(o);
         }
-        // println!(" - dead {:?}", o);
         // Recursively decrease field ref counts
         o.iterate_fields::<VM, _>(
             self.cld_policy,
@@ -829,7 +951,11 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     } else {
                         self.record_mature_evac_remset(lxr, slot, x);
                     }
-                    if self.mark_dead_objects && !lxr.is_marked(x) {
+                    // Guard: only check/set mark bits for objects in Immix/LOS.
+                    // VM-space and immortal-space objects have no side metadata
+                    // mapped — calling is_marked() or attempt_mark() on them
+                    // accesses unmapped pages → SIGSEGV.
+                    if self.mark_dead_objects && has_rc_metadata(x, lxr) && !lxr.is_marked(x) {
                         if cfg!(any(feature = "sanity", debug_assertions)) {
                             assert!(
                                 x.to_raw_address().is_mapped(),
@@ -871,8 +997,14 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     fn process_decs(&mut self, decs: &[ObjectReference], lxr: &LXR<VM>) {
         for (i, o) in decs.iter().enumerate() {
-            // Guard: skip objects not in Immix/LOS — they have no RC_TABLE metadata
-            if !has_rc_metadata(*o, lxr) {
+            // Inline space membership once — avoids redundant chunk descriptor
+            // lookups that would occur if we called has_rc_metadata() and then
+            // los.in_space() separately.  Short-circuits: if in_immix (the
+            // common case), los.in_space is never evaluated.
+            let in_immix = lxr.immix_space.in_space(*o);
+            let in_los = !in_immix && lxr.los().in_space(*o);
+            if !in_immix && !in_los {
+                // Not in any RC-tracked space (VM space, immortal, etc.)
                 continue;
             }
             if self.rc.is_dead_or_stuck(*o)
@@ -880,12 +1012,18 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             {
                 continue;
             }
-            let o =
-                if crate::args::RC_MATURE_EVACUATION && object_forwarding::is_forwarded::<VM>(*o) {
-                    object_forwarding::read_forwarding_pointer::<VM>(*o)
-                } else {
-                    *o
-                };
+            // Guard: only Immix objects have LOCAL_FORWARDING_BITS_SPEC metadata.
+            // LOS objects pass the RC metadata check (they have RC_TABLE) but do
+            // NOT have forwarding-bits metadata mapped.  Calling is_forwarded()
+            // on a LOS object reads unmapped side metadata → SIGSEGV.
+            let o = if crate::args::RC_MATURE_EVACUATION
+                && in_immix
+                && object_forwarding::is_forwarded::<VM>(*o)
+            {
+                object_forwarding::read_forwarding_pointer::<VM>(*o)
+            } else {
+                *o
+            };
             let mut dead = false;
             let mut is_los = false;
             let result = self.rc.clone().fetch_update(o, |c| {
@@ -914,6 +1052,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
 impl<VM: VMBinding> GCWork<VM> for ProcessDecs<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        // Increment GC cycle counter on the first ProcessDecs packet of each cycle.
+        // This is approximate (multiple packets per cycle) but sufficient for diagnostics.
+        GC_CYCLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         self.mark_dead_objects = if crate::args::LAZY_DECREMENTS {
             lxr.cm_in_progress() && lxr.previous_pause() != Some(Pause::InitialMark)

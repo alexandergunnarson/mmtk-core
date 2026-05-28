@@ -135,6 +135,28 @@ impl<VM: VMBinding> LXRConcurrentTraceObjects<VM> {
 
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
         // debug_assert!(object.is_in_any_space(), "Invalid object {:?}", object);
+        // Guard: skip objects not in Immix/LOS — they have no RC side metadata
+        // (e.g. VM space, immortal space).  Without this, los().trace_object_rc()
+        // tries to access unmapped metadata pages → SIGSEGV.
+        if !super::rc::has_rc_metadata(object, self.plan) {
+            return object;
+        }
+        // Guard: skip objects already freed by RC (RC=0).
+        // The concurrent marker may discover objects via stale work queue
+        // entries or SATB buffer snapshots that were alive when enqueued but
+        // have since been decremented to RC=0 and freed.  Their header and
+        // field memory may be corrupted/reused — scanning them reads garbage
+        // → SIGSEGV in iterate_fields / scan_julia_object.
+        //
+        // NOTE: we intentionally check only RC==0 (dead), NOT is_dead_or_stuck
+        // which also skips RC==MAX (stuck/saturated).  Stuck objects are ALIVE
+        // — their RC saturated from long tenure.  The concurrent marker MUST
+        // trace them to discover their children and populate the mark bitmap;
+        // skipping them would cause the backup tracing cycle to incorrectly
+        // sweep live objects reachable only through stuck-RC parents.
+        if self.rc.count(object) == 0 {
+            return object;
+        }
         if self.plan.immix_space.in_space(object) {
             self.plan
                 .immix_space
@@ -161,7 +183,13 @@ impl<VM: VMBinding> LXRConcurrentTraceObjects<VM> {
         slice: &VM::VMMemorySlice,
     ) {
         let s = slice.iter_slots().next().unwrap();
-        if SRC_IN_IMMIX
+        // Guard: the slice data may live in malloc'd memory (GenericMemory with
+        // how=1) even when the owner object is in Immix.  Only access Immix
+        // side metadata (is_marked / line_is_marked) when the slot address
+        // itself is in the Immix space; external addresses have no metadata
+        // mapped and would SIGSEGV.
+        let data_in_immix = SRC_IN_IMMIX && self.plan.immix_space.address_in_space(s.to_address());
+        if data_in_immix
             && self
                 .plan
                 .immix_space
@@ -174,7 +202,7 @@ impl<VM: VMBinding> LXRConcurrentTraceObjects<VM> {
             let Some(t) = s.load() else {
                 continue;
             };
-            if SRC_IN_IMMIX
+            if data_in_immix
                 && Line::is_aligned(s.to_address())
                 && self.plan.immix_space.line_is_marked(s.to_address())
             {
@@ -527,10 +555,20 @@ impl<VM: VMBinding, const FULL_GC: bool> LXRStopTheWorldProcessEdges<VM, FULL_GC
         debug_assert!(object.is_in_any_space());
         debug_assert!(object.to_raw_address().is_aligned_to(8));
         // debug_assert!(object.class_is_valid::<VM>());
-        if WEAK_ROOT && !Block::containing(object).is_defrag_source() {
+        // Guard: skip objects not in Immix/LOS — they have no RC_TABLE metadata.
+        // Objects in VM space (sysimage) or immortal space have permanent lifetimes
+        // and don't participate in RC.  Attempting to access their side metadata
+        // (rc.count, trace_object_rc, Block::containing) would SIGSEGV on unmapped pages.
+        let in_immix = self.lxr.immix_space.in_space(object);
+        if !in_immix && !self.lxr.los().in_space(object) {
             return object;
         }
-        let x = if self.lxr.immix_space.in_space(object) {
+        // WEAK_ROOT defrag-source check only applies to Immix objects — LOS objects
+        // are never in Immix blocks, so Block::containing would be invalid for them.
+        if WEAK_ROOT && in_immix && !Block::containing(object).is_defrag_source() {
+            return object;
+        }
+        let x = if in_immix {
             let pause = self.pause;
             let worker = self.worker();
             self.lxr.immix_space.rc_trace_object(

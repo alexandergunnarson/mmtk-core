@@ -120,31 +120,60 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         slot: VM::VMSlot,
         _new: Option<ObjectReference>,
     ) -> bool {
-        // Guard: skip slots whose addresses are outside the MMTk heap.
-        // Side metadata (unlog bits) is only mapped for addresses in the
-        // managed heap range.  Slots in malloc'd memory (e.g. external
-        // GenericMemory data buffers with how==1/2) have no metadata and
-        // would SIGSEGV on load.  This can happen when object_probable_write
-        // scans all fields of an object whose GenericMemory data is external.
-        {
+        // Check whether the slot address is in the MMTk managed heap.
+        // Slots in malloc'd memory (e.g. external GenericMemory data buffers
+        // with how==1/2) have no side metadata (unlog bits) mapped.
+        let in_heap = {
             use crate::util::heap::layout::vm_layout::vm_layout;
             let slot_addr = slot.to_address();
             let layout = vm_layout();
-            if slot_addr < layout.heap_start || slot_addr >= layout.heap_end {
-                return false;
-            }
-        }
-        if TAKERATE_MEASUREMENT && self.mmtk.inside_harness() {
-            FAST_COUNT.fetch_add(1, Ordering::SeqCst);
-        }
-        if let Ok(old) = self.log_slot_and_get_old_target(slot) {
+            slot_addr >= layout.heap_start && slot_addr < layout.heap_end
+        };
+        if in_heap {
+            // Standard path for in-heap slots: use the unlog bit to
+            // deduplicate barrier fires within a GC cycle.  Only the first
+            // write to each slot fires the slow path.
             if TAKERATE_MEASUREMENT && self.mmtk.inside_harness() {
-                SLOW_COUNT.fetch_add(1, Ordering::SeqCst);
+                FAST_COUNT.fetch_add(1, Ordering::SeqCst);
             }
+            if let Ok(old) = self.log_slot_and_get_old_target(slot) {
+                if TAKERATE_MEASUREMENT && self.mmtk.inside_harness() {
+                    SLOW_COUNT.fetch_add(1, Ordering::SeqCst);
+                }
+                self.slow(src, slot, old);
+                true
+            } else {
+                false
+            }
+        } else {
+            // Non-heap slot (e.g. external GenericMemory data, how!=0).
+            // No unlog bits exist for this address.
+            //
+            // This path is reached only from object_probable_write_slow
+            // (internal GC scanning of all fields of a modified object),
+            // NOT from the C write barrier.  The C barrier's
+            // jl_gc_wb_field_pre uses mmtk_object_reference_write_pre_nonheap
+            // for non-heap slots, which captures both old and new values
+            // explicitly and pushes old → DEC_BUFFER, Direct(new) →
+            // NONHEAP_INC_BUFFER — avoiding both the one-shot degradation
+            // (HANDOFF §53) and the RC overcount from duplicate slot pushes.
+            //
+            // For object_probable_write_slow, the slot-based approach is
+            // correct: this fires once per object per GC cycle (the parent's
+            // first-field unlog bit deduplicates), so there is no overcount
+            // from repeated pushes.  The old value is captured now (pre-
+            // write); the slot is read at GC time (post-write) to get the
+            // new value.  The malloc'd buffer remains valid because the
+            // owning GenericMemory keeps it alive.
+            //
+            // ProcessIncs handles this slot correctly: the heap range guard
+            // in unlog_and_load_rc_object skips the non-existent unlog bits;
+            // record_mature_evac_remset skips (address_in_defrag → false);
+            // store is valid (writable malloc'd memory, but nursery evac
+            // is disabled so objects are never moved).
+            let old = slot.load();
             self.slow(src, slot, old);
             true
-        } else {
-            false
         }
     }
 
@@ -256,5 +285,35 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
         obj.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |s, _| {
             let _succ = self.enqueue_node(Some(obj), s, None);
         });
+    }
+
+    fn object_reference_write_post_cmpswap(
+        &mut self,
+        src: ObjectReference,
+        slot: <Self::VM as VMBinding>::VMSlot,
+        old: Option<ObjectReference>,
+        _new: Option<ObjectReference>,
+    ) {
+        // Heap range check: skip slots outside the managed heap (no metadata).
+        {
+            use crate::util::heap::layout::vm_layout::vm_layout;
+            let slot_addr = slot.to_address();
+            let layout = vm_layout();
+            if slot_addr < layout.heap_start || slot_addr >= layout.heap_end {
+                return;
+            }
+        }
+        // Atomically log the slot's unlog bit.  If already logged by another
+        // thread or a prior barrier in this GC cycle, skip — the slot's old
+        // value was already captured.
+        if !self.attempt_to_log_field(slot) {
+            return;
+        }
+        // Push explicit old → decs, slot → incs.
+        // Unlike enqueue_node/log_slot_and_get_old_target, we do NOT read the
+        // old value from the slot (which now contains the NEW value after the
+        // successful cmpswap).  The caller provides the real old value from
+        // the cmpswap's `expected` parameter.
+        self.slow(Some(src), slot, old);
     }
 }

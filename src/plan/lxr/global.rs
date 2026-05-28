@@ -821,7 +821,9 @@ impl<VM: VMBinding> LXR<VM> {
     }
 
     pub fn in_defrag(&self, o: ObjectReference) -> bool {
-        Block::in_defrag_block::<VM>(o)
+        // Guard: only Immix objects can be in defrag blocks.
+        // VM-space and immortal-space objects have no Block metadata mapped.
+        self.immix_space.in_space(o) && Block::in_defrag_block::<VM>(o)
     }
 
     pub fn address_in_defrag(&self, a: Address) -> bool {
@@ -831,8 +833,12 @@ impl<VM: VMBinding> LXR<VM> {
     pub fn mark(&self, o: ObjectReference) -> bool {
         if self.immix_space.in_space(o) {
             self.immix_space.attempt_mark(o)
-        } else {
+        } else if self.common.los.in_space(o) {
             self.common.los.attempt_mark(o)
+        } else {
+            // VM-space / immortal-space objects have no mark-bit metadata.
+            // Treat as already marked (permanent lifetime).
+            false
         }
     }
 
@@ -847,8 +853,12 @@ impl<VM: VMBinding> LXR<VM> {
     pub fn is_marked(&self, o: ObjectReference) -> bool {
         if self.immix_space.in_space(o) {
             self.immix_space.is_marked(o)
-        } else {
+        } else if self.common.los.in_space(o) {
             self.common.los.is_marked(o)
+        } else {
+            // VM-space / immortal-space objects have no mark-bit metadata.
+            // Treat as already marked (permanent lifetime).
+            true
         }
     }
 
