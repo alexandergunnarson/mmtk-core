@@ -326,7 +326,11 @@ impl<S: BarrierSemantics> Barrier<S::VM> for ObjectBarrier<S> {
 
 /// Generic object barrier with a type argument defining it's slow-path behaviour.
 pub struct FieldBarrier<S: BarrierSemantics> {
-    semantics: S,
+    /// The barrier semantics implementation.  Public so bindings can access
+    /// plan-specific barrier internals (e.g. inc/dec queues) via downcast
+    /// when they need to push entries that don't fit the generic trait API
+    /// (non-heap slot writes, explicit RC decrements from compiled code).
+    pub semantics: S,
 }
 
 impl<S: BarrierSemantics> FieldBarrier<S> {

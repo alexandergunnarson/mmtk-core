@@ -25,15 +25,670 @@ use crate::{
 };
 use atomic::Ordering;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-/// RC death diagnostic: how many dying objects to log before suppressing.
-const DEATH_LOG_LIMIT: usize = 500;
-/// RC death diagnostic: atomic counter of dying objects logged so far.
+// RC death diagnostic instrumentation statics.
+// Only used when the `lxr_rc_death_diag` feature is enabled.
+#[cfg(feature = "lxr_rc_death_diag")]
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "lxr_rc_death_diag")]
 static DEATH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// RC death diagnostic: which GC cycle we are in (incremented in ProcessDecs::do_work).
+#[cfg(feature = "lxr_rc_death_diag")]
+const DEATH_LOG_LIMIT: usize = 500;
+#[cfg(feature = "lxr_rc_death_diag")]
 static GC_CYCLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// ========================================================================= //
+// Per-object RC tracing diagnostic (feature: lxr_rc_trace).
+//
+// Logs every RC operation (inc, dec, promotion scan, death, recursive-dec)
+// for a configurable set of target object addresses.  This is the primary
+// tool for diagnosing systematic RC undercount: after a death diagnostic run
+// (lxr_rc_death_diag) identifies dying addresses, set those addresses via
+// rc_trace_add_addr() or MMTK_RC_TRACE_ADDRS env var, rebuild, and rerun.
+// The trace log shows every RC change for those objects, revealing which
+// expected increment is missing.
+//
+// Usage:
+//   1. Build with --features lxr_rc_death_diag to identify dying addresses
+//   2. Set MMTK_RC_TRACE_ADDRS=0x...,0x...,... (comma-separated hex addrs)
+//   3. Build with --features lxr_rc_trace (can combine with lxr_rc_death_diag)
+//   4. Run bootstrap — trace log on stderr shows every RC op for those objects
+//
+// Each log line has the format:
+//   [rc-trace gc=N OP] 0xADDR details...
+// where OP is one of:
+//   inc          — RC incremented (old_rc → old_rc+1)
+//   inc-slot     — slot processing caused an increment (shows slot addr, edge kind)
+//   inc-promo    — promotion scan found this as a child (shows parent addr)
+//   inc-promo-direct — direct RC inc during promotion (already mature child)
+//   dec          — RC decremented (old_rc → old_rc-1)
+//   death        — object freed (RC reached 0)
+//   rec-dec      — recursive dec from a dying parent (shows parent addr)
+//   promote      — object promoted from nursery (RC 0→1)
+// ========================================================================= //
+
+#[cfg(feature = "lxr_rc_trace")]
+use std::sync::atomic::AtomicUsize as RcTraceAtomicUsize;
+
+/// Maximum number of simultaneously traced object addresses.
+#[cfg(feature = "lxr_rc_trace")]
+const RC_TRACE_MAX_ADDRS: usize = 16;
+
+/// Target addresses for RC tracing.  Set via rc_trace_add_addr() or
+/// parsed from MMTK_RC_TRACE_ADDRS env var during mmtk_gc_init.
+#[cfg(feature = "lxr_rc_trace")]
+static RC_TRACE_ADDRS: [RcTraceAtomicUsize; RC_TRACE_MAX_ADDRS] = {
+    // const initializer — array of AtomicUsize::new(0)
+    const ZERO: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+    [ZERO; RC_TRACE_MAX_ADDRS]
+};
+
+/// Number of active trace addresses (monotonically increasing, capped at RC_TRACE_MAX_ADDRS).
+#[cfg(feature = "lxr_rc_trace")]
+static RC_TRACE_COUNT: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+
+/// Optional VTAG to trace.  When non-zero, EVERY object whose Julia type tag
+/// (the word at `obj-8`, with the low GC bits masked) equals this value is
+/// traced — not just the explicit per-address set.  This makes type-targeted
+/// tracing DETERMINISTIC across the nondeterministic bootstrap: e.g. set
+/// `MMTK_RC_TRACE_VTAG=0x200ffc01c00` to trace all TypeMapEntry objects and
+/// observe the full inc/promote/dec/death pattern of the undercounted class.
+/// Set via `MMTK_RC_TRACE_VTAG` env var during `mmtk_gc_init`.
+#[cfg(feature = "lxr_rc_trace")]
+static RC_TRACE_VTAG: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+
+/// GC cycle counter for trace log timestamps.
+#[cfg(feature = "lxr_rc_trace")]
+static RC_TRACE_GC_COUNT: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+
+/// Counters for the corruption guard in `process_slot` (rate-limiting).
+#[cfg(feature = "lxr_rc_trace")]
+static CORRUPT_LOG_COUNT: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+#[cfg(feature = "lxr_rc_trace")]
+const CORRUPT_LOG_LIMIT: usize = 50;
+#[cfg(feature = "lxr_rc_trace")]
+const CORRUPT_SCAN_LIMIT: usize = 5;
+
+// ===================================================================== //
+// Death-time genuine-undercount detector (§2.17 step 1/2).
+//
+// The corruption guard in `process_slot`/`scan_nursery_object` only fires
+// when a GC inc-slot or promotion path touches the dangling object.  But the
+// §2.17 frontier is nondeterministic: the freed-and-reused young object is
+// often consumed by the MUTATOR (a corrupted AST node read during lowering)
+// BEFORE any GC scans it, so no guard fires and we get a plain SIGSEGV with
+// no diagnostic.
+//
+// This detector closes that gap by catching the bug at the MOMENT OF DEATH:
+// when an object is freed, scan the live heap for any external referrer.  A
+// freed object with a LIVE heap referrer (matches>0) is the genuine RC
+// undercount — the slot whose missing inc/barrier is the root-cause bug.
+// (§2.16 proved the 501 BindingPartition deaths have matches=0 — they are
+// benign; this detector specifically excludes those by reporting only
+// matches>0.)
+//
+// The referrer scan is O(live-heap) per death, so it is BUDGETED:
+//   - Only runs from GC cycle `MMTK_RC_UNDERCOUNT_FROM_GC` onward (the
+//     undercount surfaces late, ~GC 27; default 0 = always).
+//   - At most `MMTK_RC_UNDERCOUNT_BUDGET` scans total (default 200).
+// When a death with a live referrer is found, it logs the dying object's
+// vtag + every referrer word (verbose scan) so the storing slot/parent is
+// identified, then `MMTK_RC_TRACE_ADDRS` can be pointed at it.
+#[cfg(feature = "lxr_rc_trace")]
+static UNDERCOUNT_SCAN_BUDGET: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+#[cfg(feature = "lxr_rc_trace")]
+static UNDERCOUNT_FROM_GC: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+#[cfg(feature = "lxr_rc_trace")]
+static UNDERCOUNT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "lxr_rc_trace")]
+static UNDERCOUNT_FOUND: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+#[cfg(feature = "lxr_rc_trace")]
+const UNDERCOUNT_FOUND_LIMIT: usize = 20;
+
+/// Parse `MMTK_RC_UNDERCOUNT_BUDGET` / `MMTK_RC_UNDERCOUNT_FROM_GC` to enable
+/// the death-time genuine-undercount detector.  Setting either enables it.
+#[cfg(feature = "lxr_rc_trace")]
+pub fn rc_undercount_init_from_env() {
+    let mut enabled = false;
+    if let Ok(v) = std::env::var("MMTK_RC_UNDERCOUNT_BUDGET") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            UNDERCOUNT_SCAN_BUDGET.store(n, Ordering::SeqCst);
+            enabled = true;
+        }
+    } else {
+        // Default budget if the detector is enabled only via FROM_GC.
+        UNDERCOUNT_SCAN_BUDGET.store(200, Ordering::SeqCst);
+    }
+    if let Ok(v) = std::env::var("MMTK_RC_UNDERCOUNT_FROM_GC") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            UNDERCOUNT_FROM_GC.store(n, Ordering::SeqCst);
+            enabled = true;
+        }
+    }
+    if enabled {
+        UNDERCOUNT_ENABLED.store(true, Ordering::SeqCst);
+        eprintln!(
+            "[rc-undercount] death-time genuine-undercount detector ENABLED (budget={}, from_gc={})",
+            UNDERCOUNT_SCAN_BUDGET.load(Ordering::SeqCst),
+            UNDERCOUNT_FROM_GC.load(Ordering::SeqCst),
+        );
+    }
+}
+
+/// Add an address to the RC trace set.  Thread-safe (uses atomic CAS on the count).
+/// Returns true if the address was added, false if the set is full.
+#[cfg(feature = "lxr_rc_trace")]
+pub fn rc_trace_add_addr(addr: usize) {
+    let idx = RC_TRACE_COUNT.fetch_add(1, Ordering::SeqCst);
+    if idx < RC_TRACE_MAX_ADDRS {
+        RC_TRACE_ADDRS[idx].store(addr, Ordering::SeqCst);
+        eprintln!("[rc-trace] Tracing address {:#x} (slot {})", addr, idx);
+    } else {
+        RC_TRACE_COUNT.fetch_sub(1, Ordering::SeqCst);
+        eprintln!(
+            "[rc-trace] WARNING: trace set full (max {}), ignoring {:#x}",
+            RC_TRACE_MAX_ADDRS, addr
+        );
+    }
+}
+
+/// Initialize trace addresses from the MMTK_RC_TRACE_ADDRS environment variable.
+/// Format: comma-separated hex addresses, e.g. "0x200ffc01000,0x200ffc02000"
+#[cfg(feature = "lxr_rc_trace")]
+pub fn rc_trace_init_from_env() {
+    if let Ok(val) = std::env::var("MMTK_RC_TRACE_ADDRS") {
+        for part in val.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let addr_str = part
+                .strip_prefix("0x")
+                .or_else(|| part.strip_prefix("0X"))
+                .unwrap_or(part);
+            match usize::from_str_radix(addr_str, 16) {
+                Ok(addr) => rc_trace_add_addr(addr),
+                Err(e) => eprintln!("[rc-trace] WARNING: failed to parse '{}': {}", part, e),
+            }
+        }
+    }
+    // Optional deterministic type-targeted tracing by vtag.
+    if let Ok(val) = std::env::var("MMTK_RC_TRACE_VTAG") {
+        let s = val.trim();
+        let hex = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
+        match usize::from_str_radix(hex, 16) {
+            Ok(vtag) => {
+                RC_TRACE_VTAG.store(vtag & !0xfusize, Ordering::SeqCst);
+                eprintln!(
+                    "[rc-trace] Tracing ALL objects with vtag {:#x}",
+                    vtag & !0xfusize
+                );
+            }
+            Err(e) => eprintln!(
+                "[rc-trace] WARNING: failed to parse MMTK_RC_TRACE_VTAG '{}': {}",
+                val, e
+            ),
+        }
+    }
+}
+
+/// Increment the trace GC cycle counter.  Call once per GC cycle.
+#[cfg(feature = "lxr_rc_trace")]
+pub fn rc_trace_inc_gc_count() {
+    RC_TRACE_GC_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Check whether an object is in the RC trace set.
+#[cfg(feature = "lxr_rc_trace")]
+#[inline]
+pub(super) fn is_rc_traced(o: ObjectReference) -> bool {
+    let addr = o.to_raw_address().as_usize();
+    let count = RC_TRACE_COUNT.load(Ordering::Relaxed);
+    for i in 0..count.min(RC_TRACE_MAX_ADDRS) {
+        if RC_TRACE_ADDRS[i].load(Ordering::Relaxed) == addr {
+            return true;
+        }
+    }
+    // VTAG match (deterministic type-targeted tracing).  Read the tag word at
+    // `obj-8` and mask the low 4 GC/marking bits that Julia stores in the tag.
+    let want_vtag = RC_TRACE_VTAG.load(Ordering::Relaxed);
+    if want_vtag != 0 {
+        let tag_addr = o.to_raw_address() - 8usize;
+        if tag_addr.is_mapped() {
+            let raw = unsafe { tag_addr.load::<usize>() };
+            if (raw & !0xfusize) == want_vtag {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Get current GC cycle for trace log.
+#[cfg(feature = "lxr_rc_trace")]
+#[inline]
+pub(super) fn rc_trace_gc() -> usize {
+    RC_TRACE_GC_COUNT.load(Ordering::Relaxed)
+}
+
+/// Diagnostic (lxr_rc_trace): walk the entire live heap (Immix + LOS) and
+/// report every word in any live block that holds the address of `target`.
+/// Used to find the "untracked referrer" of a dying/corrupt object.
+///
+/// This performs a RAW word-by-word memory scan of every allocated block (not a
+/// VO-bit object walk), because under LXR the VO bits are not a reliable object
+/// map during the lazy RC sweep.  If this reports ZERO matches, the dangling
+/// pointer is a C stack local (a missing GC root), not a missing barrier.
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn scan_heap_referrers<VM: VMBinding>(target: ObjectReference, lxr: &LXR<VM>) {
+    let (words, matches) = scan_heap_referrers_collect(target, lxr, true);
+    eprintln!(
+        "[rc-trace gc={} referrer-scan-done] target={:#x} words_scanned={} matches={}",
+        rc_trace_gc(),
+        target.to_raw_address().as_usize(),
+        words,
+        matches,
+    );
+}
+
+/// Diagnostic (lxr_rc_trace): given the address of a heap WORD that holds a
+/// pointer to a freed object (a "referrer word" / dangling slot), walk
+/// backward word-by-word to find the OWNING Julia object — i.e. the object
+/// whose field that word is.  Returns a human-readable description of the
+/// owner (its type name + the field byte-offset of the dangling slot) so the
+/// type/store-site with the missing RC inc/barrier can be identified.
+///
+/// VO bits are unreliable mid-sweep (see `scan_heap_referrers`), so this does
+/// NOT use `find_object_from_internal_pointer`.  Instead it scans backward up
+/// to `MAX_BACK` bytes for the first candidate object-start whose tag-at-−8 is
+/// a valid DataType (`debug_object_tag_is_valid`) AND whose size covers the
+/// referrer word.  Bounded and best-effort: returns `<owner-not-found>` if no
+/// plausible owner is located within the search window.
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn describe_referrer_owner<VM: VMBinding>(slot_addr: usize) -> String {
+    describe_referrer_owner_with_lxr::<VM>(slot_addr, None)
+}
+
+/// Decisive liveness filter for the genuine-undercount detector.
+///
+/// `enumerate_objects` walks every word of every ALLOCATED block, including
+/// dead-but-not-yet-swept objects and stale data in free holes (LXR sweeps
+/// lazily).  So a raw word-match against a freed target is NOT proof of an RC
+/// undercount: the matching word may itself live in DEAD memory (a dangling
+/// pointer in an object that is also about to be reclaimed).
+///
+/// This walks backward from the referrer word to the nearest plausible object
+/// start (valid tag-at-−8) and returns `true` only if that owner is GENUINELY
+/// LIVE — i.e. `rc>0` OR `marked` (in immix/los), or it lives in a
+/// non-RC-tracked permanent space (VM/immortal).  An owner that is `rc==0` and
+/// `!marked` is dead-unswept, so the referrer is a FALSE POSITIVE and must not
+/// be counted as an undercount.
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn referrer_owner_is_live<VM: VMBinding>(slot_addr: usize, lxr: &LXR<VM>) -> bool {
+    use crate::policy::space::Space;
+    use crate::util::Address;
+    const MAX_BACK: usize = 4096;
+    let word = std::mem::size_of::<usize>();
+    let mut cand = (slot_addr & !(word - 1)).saturating_sub(word);
+    let lo = slot_addr.saturating_sub(MAX_BACK);
+    while cand >= lo {
+        let cand_addr = unsafe { Address::from_usize(cand) };
+        if cand_addr.is_mapped() && (cand_addr - 8usize).is_mapped() {
+            let oref = unsafe { ObjectReference::from_raw_address_unchecked(cand_addr) };
+            if VM::VMScanning::debug_object_tag_is_valid(oref) {
+                let in_immix = lxr.immix_space.in_space(oref);
+                let in_los = lxr.los().in_space(oref);
+                if in_immix || in_los {
+                    let live = RefCountHelper::<VM>::NEW.count(oref) > 0 || lxr.is_marked(oref);
+                    // Found the nearest RC-tracked owner: its liveness is
+                    // authoritative.  (If it is dead, keep searching backward
+                    // only if a closer dead object could shadow a live one —
+                    // but the NEAREST valid owner is the real container, so we
+                    // return its verdict directly.)
+                    return live;
+                } else {
+                    // Non-RC-tracked permanent space (VM/immortal/nonmoving):
+                    // always live.
+                    return true;
+                }
+            }
+        }
+        if cand < word {
+            break;
+        }
+        cand -= word;
+    }
+    // No plausible owner found within the window — conservatively treat as NOT
+    // live (a dangling word in a free hole has no object owner).
+    false
+}
+
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn describe_referrer_owner_with_lxr<VM: VMBinding>(
+    slot_addr: usize,
+    lxr: Option<&LXR<VM>>,
+) -> String {
+    use crate::util::Address;
+    // Object headers are 16-byte aligned in Julia's allocator; the tag is at
+    // obj-8, data starts at obj.  Search backward from the slot's own word.
+    //
+    // The heap is dense, so several backward addresses may have a `-8` word
+    // that spuriously validates as a DataType.  To disambiguate, we collect up
+    // to a few candidate owners (valid tag-at-−8 + size covers the slot) and
+    // report all of them; the true owner is the one whose type + field offset
+    // matches a known pointer field of that type.  We exclude `cand ==
+    // slot_addr` (field_off 0 where the slot's OWN location is treated as an
+    // object header — a common spurious self-match), since a genuine
+    // pointer-bearing object almost never starts exactly at the dangling slot.
+    //
+    // SAFETY: this runs while the heap is mid-sweep, so it uses ONLY
+    // single-word reads guarded by `is_mapped()` and `debug_object_type_name`
+    // (which does not traverse the type layout or any data fields).  It does
+    // NOT call `get_size`/`debug_describe_object`, which can fault on a
+    // partially-freed object.  Because exact size is unavailable, it reports
+    // EVERY backward candidate (up to MAX_CANDS) whose tag-at-−8 is a valid
+    // DataType and whose distance to the slot is within a conservative max
+    // object span; the true owner is the nearest candidate whose type's
+    // pointer-field layout includes `field_off`.
+    const MAX_BACK: usize = 4096;
+    const MAX_CANDS: usize = 4;
+    let word = std::mem::size_of::<usize>();
+    let mut cand = (slot_addr & !(word - 1)).saturating_sub(word);
+    let lo = slot_addr.saturating_sub(MAX_BACK);
+    let mut out = String::new();
+    let mut found = 0usize;
+    while cand >= lo && found < MAX_CANDS {
+        let cand_addr = unsafe { Address::from_usize(cand) };
+        if cand_addr.is_mapped() && (cand_addr - 8usize).is_mapped() {
+            let oref = unsafe { ObjectReference::from_raw_address_unchecked(cand_addr) };
+            if VM::VMScanning::debug_object_tag_is_valid(oref) {
+                let tn = VM::VMScanning::debug_object_type_name(oref);
+                if !tn.is_empty() {
+                    let field_off = slot_addr - cand;
+                    if !out.is_empty() {
+                        out.push_str(" | ");
+                    }
+                    // Report the owner candidate's RC count, space, and mark
+                    // state.  This is decisive for Class B: if the true owner
+                    // (a mature cache buffer) has rc>0 and lives in immix, then
+                    // its field unlog bits should be UNLOGGED and the store of
+                    // the dying object SHOULD have fired the barrier.  If the
+                    // owner has rc==0 (untracked) or is unmarked, the buffer
+                    // itself was never RC-tracked → its slots never re-armed.
+                    let (rc_str, space_str, marked_str) = if let Some(lxr) = lxr {
+                        let rc = RefCountHelper::<VM>::NEW.count(oref);
+                        let sp = if lxr.immix_space.in_space(oref) {
+                            "immix"
+                        } else if lxr.los().in_space(oref) {
+                            "los"
+                        } else {
+                            "other"
+                        };
+                        (format!("{}", rc), sp, format!("{}", lxr.is_marked(oref)))
+                    } else {
+                        ("?".to_string(), "?", "?".to_string())
+                    };
+                    out.push_str(&format!(
+                        "cand_owner={:#x} field_off={} type={} owner_rc={} owner_space={} owner_marked={}",
+                        cand, field_off, tn, rc_str, space_str, marked_str,
+                    ));
+                    found += 1;
+                }
+            }
+        }
+        if cand < word {
+            break;
+        }
+        cand -= word;
+    }
+    if out.is_empty() {
+        "<owner-not-found>".to_string()
+    } else {
+        out
+    }
+}
+
+/// Diagnostic (lxr_rc_trace): name the space that a referrer WORD lives in.
+/// Helps classify whether a dangling pointer is held by a mature Immix object,
+/// a LOS buffer, the VM space (sysimage), the immortal space, or the nonmoving
+/// space — which narrows down the missing-barrier store site.
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn referrer_space_name<VM: VMBinding>(
+    a: crate::util::Address,
+    lxr: &LXR<VM>,
+) -> &'static str {
+    use crate::policy::space::Space;
+    if lxr.immix_space.address_in_space(a) {
+        "immix"
+    } else if lxr.los().address_in_space(a) {
+        "los"
+    } else if lxr.common.immortal.address_in_space(a) {
+        "immortal"
+    } else {
+        "other"
+    }
+}
+
+/// Diagnostic (lxr_rc_trace): the core raw heap-wide reverse-reference scan.
+/// Walks every word of every live Immix + LOS block and counts (optionally
+/// logging) every word that equals `target`'s address but lives OUTSIDE
+/// `target`'s own page (so self-referential `next`/`restriction` fields are not
+/// counted as external referrers).  Returns `(words_scanned, matches)`.
+///
+/// `verbose=true` logs each matching word's address; `verbose=false` is the
+/// quiet variant used by the death-time genuine-undercount detector, which
+/// scans MANY deaths and only wants the match count to decide whether a death
+/// is a real RC undercount (a freed object still pointed to by a live slot).
+#[cfg(feature = "lxr_rc_trace")]
+pub(super) fn scan_heap_referrers_collect<VM: VMBinding>(
+    target: ObjectReference,
+    lxr: &LXR<VM>,
+    verbose: bool,
+) -> (usize, usize) {
+    use crate::policy::space::Space;
+    use crate::util::object_enum::ObjectEnumerator;
+    use crate::util::Address;
+
+    let target_addr = target.to_raw_address().as_usize();
+
+    // Collect referrer-word addresses during the (single) heap walk WITHOUT
+    // doing any re-entrant heap reads (owner backward-scan, hexdump, unlog-bit
+    // reads).  Those secondary reads are deferred until AFTER enumeration
+    // completes, because performing them inside `enumerate_objects` (which
+    // holds the space's block iterator mid-sweep) can fault on a
+    // partially-reclaimed neighbour.  This is why the previous "do a quiet
+    // scan, then a second verbose scan" approach SIGSEGV'd on the second walk:
+    // a single collect-then-describe pass is both cheaper and crash-safe.
+    struct RawWordScanner {
+        target: usize,
+        self_page: usize,
+        matches: usize,
+        words: usize,
+        collect: bool,
+        hits: Vec<usize>,
+    }
+    impl ObjectEnumerator for RawWordScanner {
+        fn visit_object(&mut self, _object: ObjectReference) {}
+        fn visit_address_range(&mut self, start: Address, end: Address) {
+            let mut a = start;
+            while a < end {
+                if a.is_mapped() {
+                    let w = unsafe { a.load::<usize>() };
+                    self.words += 1;
+                    // Skip words inside the target's own page (self-references
+                    // in its `next`/`restriction` are not external referrers).
+                    if w == self.target && (a.as_usize() & !0xfff) != self.self_page {
+                        if self.collect && self.hits.len() < 64 {
+                            self.hits.push(a.as_usize());
+                        }
+                        self.matches += 1;
+                    }
+                }
+                a += std::mem::size_of::<usize>();
+            }
+        }
+    }
+
+    let mut scanner = RawWordScanner {
+        target: target_addr,
+        self_page: target_addr & !0xfff,
+        matches: 0,
+        words: 0,
+        collect: true, // always collect hits so we can apply the liveness filter
+        hits: Vec::new(),
+    };
+    lxr.immix_space.enumerate_objects(&mut scanner);
+    lxr.los().enumerate_objects(&mut scanner);
+
+    // Decisive correction (§2.18 re-examination): `enumerate_objects` walks ALL
+    // allocated memory, including dead-but-unswept objects and stale words in
+    // free holes.  A raw word-match is therefore NOT a genuine undercount on
+    // its own.  Re-count only hits whose OWNER object is genuinely live
+    // (rc>0 || marked, or a permanent space).  `matches` returned to callers is
+    // this LIVE count — the real undercount signal.
+    let live_matches = scanner
+        .hits
+        .iter()
+        .filter(|at| referrer_owner_is_live::<VM>(**at, lxr))
+        .count();
+
+    // Only emit the (expensive, verbose) per-referrer dump when there is at
+    // least one GENUINELY LIVE referrer — i.e. a real undercount.  This keeps
+    // the proven-benign dead-unswept matches from flooding the log.
+    if verbose && live_matches > 0 {
+        for at in &scanner.hits {
+            let a = unsafe { Address::from_usize(*at) };
+            let owner_live = referrer_owner_is_live::<VM>(*at, lxr);
+            // Whether the slot's FIELD UNLOG BIT is currently "logged" (0).
+            // A `logged` referrer slot means the LXR field-logging barrier
+            // would SKIP a store into it, so the stored object was never
+            // RC-incremented: that IS the missing-barrier mechanism for the
+            // undercount.
+            let logged = a.is_field_logged::<VM>();
+            eprintln!(
+                "[rc-trace referrer-word] at={:#x} space={} owner_live={} field_logged={} -> {:#x} {}",
+                a.as_usize(),
+                referrer_space_name::<VM>(a, lxr),
+                owner_live,
+                logged,
+                target_addr,
+                describe_referrer_owner_with_lxr::<VM>(a.as_usize(), Some(lxr)),
+            );
+            // Raw hexdump of the 16 words preceding (and incl.) the referrer
+            // slot, to manually decode the owning object header (tag-at-−8)
+            // when the backward-scan owner-finder is ambiguous in a dense heap.
+            let mut dump = String::new();
+            for k in (0..16isize).rev() {
+                let wa = a - (k as usize) * std::mem::size_of::<usize>();
+                if wa.is_mapped() {
+                    dump.push_str(&format!(" [{:#x}]={:#x}", wa.as_usize(), unsafe {
+                        wa.load::<usize>()
+                    },));
+                }
+            }
+            eprintln!("[rc-trace referrer-dump]{}", dump);
+        }
+    }
+    // Return the LIVE referrer count (the genuine undercount signal), NOT the
+    // raw word-match count `scanner.matches` (which includes dangling pointers
+    // in dead-but-unswept memory and stale words in free holes).
+    (scanner.words, live_matches)
+}
+
+/// Death-time genuine-undercount detector (§2.17).  Called from
+/// `process_dead_object` for every freed object.  If the detector is enabled
+/// (via `MMTK_RC_UNDERCOUNT_BUDGET`/`_FROM_GC`) and we are at/after the
+/// configured GC cycle with budget remaining, do a quiet heap-wide
+/// reverse-reference scan.  If the freed object STILL has a live external
+/// referrer (matches>0), this is the genuine RC undercount: log the dying
+/// object's vtag/size, then do a VERBOSE scan to print every referrer word so
+/// the storing slot/parent is identified.  Returns immediately (near-zero
+/// cost) when disabled, out of budget, or before the configured GC cycle.
+#[cfg(feature = "lxr_rc_trace")]
+#[cold]
+pub(super) fn detect_death_undercount<VM: VMBinding>(o: ObjectReference, lxr: &LXR<VM>) {
+    if !UNDERCOUNT_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if rc_trace_gc() < UNDERCOUNT_FROM_GC.load(Ordering::Relaxed) {
+        return;
+    }
+    // Spend one unit of budget (saturating-ish via CAS-free fetch_sub guard).
+    let remaining = UNDERCOUNT_SCAN_BUDGET.load(Ordering::Relaxed);
+    if remaining == 0 {
+        return;
+    }
+    UNDERCOUNT_SCAN_BUDGET.fetch_sub(1, Ordering::Relaxed);
+
+    // Single verbose collect-then-describe scan (see
+    // `scan_heap_referrers_collect`): the previous code did one quiet scan
+    // followed by a second verbose scan, and the second full heap walk
+    // reproducibly SIGSEGV'd mid-sweep.  We now do exactly one walk.  If there
+    // are no live referrers, the per-hit describe loop simply runs zero times.
+    let (_words, matches) = scan_heap_referrers_collect(o, lxr, true);
+    if matches == 0 {
+        // Benign death (no live referrer) — e.g. the proven-benign 501
+        // BindingPartition deaths (§2.16).  Do not report.
+        return;
+    }
+    let found = UNDERCOUNT_FOUND.fetch_add(1, Ordering::Relaxed);
+    if found >= UNDERCOUNT_FOUND_LIMIT {
+        return;
+    }
+    let obj_addr = o.to_raw_address();
+    let tag_addr = obj_addr - 8usize;
+    let vtag: usize = if tag_addr.is_mapped() {
+        unsafe { tag_addr.load::<usize>() }
+    } else {
+        0
+    };
+    let size = if obj_addr.is_mapped() {
+        o.get_size::<VM>()
+    } else {
+        0
+    };
+    // Report the dying object's own mark state.  If it is MARKED (mark-live)
+    // but freed with rc==0, that is the RC-vs-trace inconsistency: the
+    // concurrent tracer reached it (so a live object points to it) yet RC
+    // drove it to 0 and reclaimed it.
+    let marked = lxr.is_marked(o);
+    // Name the dying object's type from the (still-mapped) vtag rather than
+    // `debug_describe_object`, which calls `get_size`/layout traversal and can
+    // fault on a mid-free object.
+    let desc = {
+        let vt = unsafe { ObjectReference::from_raw_address_unchecked(o.to_raw_address()) };
+        VM::VMScanning::debug_object_type_name(vt)
+    };
+    eprintln!(
+        "[rc-undercount gc={} GENUINE-UNDERCOUNT #{}] freed={:#x} vtag={:#x} size={} live_referrers={} marked={} desc={} — a LIVE slot still references this FREED object (missing inc/barrier)",
+        rc_trace_gc(),
+        found,
+        obj_addr.as_usize(),
+        vtag,
+        size,
+        matches,
+        marked,
+        desc,
+    );
+}
+
+/// Check whether a raw address (e.g. a slot address) is in the RC trace set.
+#[cfg(feature = "lxr_rc_trace")]
+#[inline]
+pub(super) fn is_rc_traced_addr(addr: usize) -> bool {
+    let count = RC_TRACE_COUNT.load(Ordering::Relaxed);
+    for i in 0..count.min(RC_TRACE_MAX_ADDRS) {
+        if RC_TRACE_ADDRS[i].load(Ordering::Relaxed) == addr {
+            return true;
+        }
+    }
+    false
+}
 
 /// Check whether an object resides in a space that has RC_TABLE side metadata
 /// mapped (Immix or LOS).  Objects in other spaces (VM space, immortal, non-moving)
@@ -143,6 +798,17 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     fn promote(&mut self, o: ObjectReference, copied: bool, los: bool, depth: u32) {
         o.verify::<VM>();
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced(o) {
+            eprintln!(
+                "[rc-trace gc={} promote] {:#x} copied={} los={} depth={}",
+                rc_trace_gc(),
+                o.to_raw_address(),
+                copied,
+                los,
+                depth
+            );
+        }
         crate::stat(|s| {
             s.promoted_objects += 1;
             s.promoted_volume += o.get_size::<VM>();
@@ -260,6 +926,46 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 let Some(target) = slot.load() else {
                     return;
                 };
+                // Misclassification guard (lxr_rc_trace): a value/isbits array
+                // scanned as a pointer array will feed data words (Float bits,
+                // BitSet masks, poison) here as ObjectReferences.  Detect that
+                // at the SOURCE (parent in scope) by validating the loaded
+                // child's header word, and log the parent's full array
+                // classification so the misclassified array can be identified.
+                #[cfg(feature = "lxr_rc_trace")]
+                {
+                    // Validate the child's Julia TYPE TAG denotes a valid type.
+                    // This is the exact check `get_current_size`/
+                    // `scan_julia_object` performs (it panics otherwise).  It
+                    // reads the tag at `obj - 8` and confirms it resolves to a
+                    // real DataType — NOT a check of the first data field at
+                    // offset 0 (which legally holds isbits values and would give
+                    // false positives).  A `false` result is a genuine
+                    // freed/reused object referenced by a live slot = RC
+                    // undercount.  Log the parent's full description so the
+                    // missing barrier/store can be located.
+                    if !VM::VMScanning::debug_object_tag_is_valid(target) {
+                        let tag_addr = target.to_raw_address() - 8usize;
+                        let tag_word: usize =
+                            if tag_addr.is_mapped() { unsafe { tag_addr.load::<usize>() } } else { 0 };
+                        let n = CORRUPT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n < CORRUPT_LOG_LIMIT {
+                            eprintln!(
+                                "[rc-trace gc={} CORRUPT promo-child-bad-tag #{}] child={:#x} tag={:#x} slot={:?} parent={:#x} parent_desc={}",
+                                rc_trace_gc(),
+                                n,
+                                target.to_raw_address(),
+                                tag_word,
+                                slot,
+                                o.to_raw_address(),
+                                VM::VMScanning::debug_describe_object(o),
+                            );
+                            if n < CORRUPT_SCAN_LIMIT {
+                                scan_heap_referrers(target, self.lxr);
+                            }
+                        }
+                    }
+                }
                 // println!(" -- rec inc opt {:?}.{:?} -> {:?}", o, slot, target);
                 debug_assert!(
                     target.to_raw_address().is_mapped(),
@@ -277,14 +983,35 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 );
                 // Guard: skip RC ops for objects not in Immix/LOS (no RC_TABLE metadata)
                 if !self.object_has_rc_metadata(target) {
+                    #[cfg(feature = "lxr_rc_trace")]
+                    if is_rc_traced(target) {
+                        eprintln!(
+                            "[rc-trace gc={} inc-promo-skip] {:#x} parent={:#x} slot={:?} (no RC metadata, e.g. VM/immortal space)",
+                            rc_trace_gc(), target.to_raw_address(), o.to_raw_address(), slot
+                        );
+                    }
                     return;
                 }
                 let rc = self.rc.count(target);
                 if rc == 0 {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
+                    #[cfg(feature = "lxr_rc_trace")]
+                    if is_rc_traced(target) {
+                        eprintln!(
+                            "[rc-trace gc={} inc-promo] {:#x} parent={:#x} slot={:?} child_rc=0 (queued for recursive promotion)",
+                            rc_trace_gc(), target.to_raw_address(), o.to_raw_address(), slot
+                        );
+                    }
                     self.add_new_slot(slot);
                 } else {
                     if rc != crate::util::rc::MAX_REF_COUNT {
+                        #[cfg(feature = "lxr_rc_trace")]
+                        if is_rc_traced(target) {
+                            eprintln!(
+                                "[rc-trace gc={} inc-promo-direct] {:#x} parent={:#x} slot={:?} rc: {} -> {}",
+                                rc_trace_gc(), target.to_raw_address(), o.to_raw_address(), slot, rc, rc + 1
+                            );
+                        }
                         let _ = self.rc.inc(target);
                     }
                     self.record_mature_evac_remset2(obj_in_defrag, slot, target);
@@ -307,7 +1034,26 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     }
 
     fn inc(&self, o: ObjectReference) -> bool {
-        self.rc.inc(o) == Ok(0)
+        let result = self.rc.inc(o);
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced(o) {
+            match result {
+                Ok(old_rc) => eprintln!(
+                    "[rc-trace gc={} inc] {:#x} rc: {} -> {}",
+                    rc_trace_gc(),
+                    o.to_raw_address(),
+                    old_rc,
+                    old_rc + 1
+                ),
+                Err(old_rc) => eprintln!(
+                    "[rc-trace gc={} inc-stuck] {:#x} rc: {} (stuck/max, not incremented)",
+                    rc_trace_gc(),
+                    o.to_raw_address(),
+                    old_rc
+                ),
+            }
+        }
+        result == Ok(0)
     }
 
     fn dont_evacuate(&self, o: ObjectReference, los: bool) -> bool {
@@ -453,6 +1199,35 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         depth: u32,
         add_root_to_remset: bool,
     ) -> Option<ObjectReference> {
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced_addr(s.to_address().as_usize()) {
+            let kind_str = match K {
+                EDGE_KIND_ROOT => "ROOT",
+                EDGE_KIND_NURSERY => "NURSERY",
+                EDGE_KIND_MATURE => "MATURE",
+                _ => "UNKNOWN",
+            };
+            let loaded_o = s.load();
+            let loaded = loaded_o.map(|o| o.to_raw_address().as_usize()).unwrap_or(0);
+            let lrc = if let Some(o) = loaded_o {
+                if self.object_has_rc_metadata(o) {
+                    self.rc.count(o) as isize
+                } else {
+                    -1
+                }
+            } else {
+                -2
+            };
+            eprintln!(
+                "[rc-trace gc={} process-slot] slot={:#x} kind={} loaded={:#x} rc={} depth={}",
+                rc_trace_gc(),
+                s.to_address().as_usize(),
+                kind_str,
+                loaded,
+                lrc,
+                depth
+            );
+        }
         let o = match self.unlog_and_load_rc_object::<K>(s) {
             Some(o) => o,
             _ => {
@@ -461,6 +1236,94 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         };
         // println!(" - inc {:?}: {:?} rc={}", s, o, self.rc.count(o));
         o.verify::<VM>();
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced(o) {
+            let kind_str = match K {
+                EDGE_KIND_ROOT => "ROOT",
+                EDGE_KIND_NURSERY => "NURSERY",
+                EDGE_KIND_MATURE => "MATURE",
+                _ => "UNKNOWN",
+            };
+            let rc_before = if self.object_has_rc_metadata(o) {
+                self.rc.count(o) as isize
+            } else {
+                -1 // not in RC space
+            };
+            eprintln!(
+                "[rc-trace gc={} inc-slot] {:#x} slot={:?} kind={} rc_before={} depth={}",
+                rc_trace_gc(),
+                o.to_raw_address(),
+                s,
+                kind_str,
+                rc_before,
+                depth
+            );
+        }
+        // Corruption guard (lxr_rc_trace): before processing an inc on `o`,
+        // validate that `o`'s Julia TYPE TAG (vtag) denotes a real DataType.
+        //
+        // The vtag lives at `o - sizeof(jl_taggedvalue_t)` (= o - 8), NOT at
+        // offset 0 (which is the object's first DATA field and may legally hold
+        // any isbits value such as 0xffff... for a BitSet chunk or a Float bit
+        // pattern — reading offset 0 produces false positives; §2.16's
+        // "value-array scanned as pointers" claim was exactly that artifact).
+        //
+        // §2.17: the previous guard here used a LAX plausibility check ("vt is
+        // small OR a mapped pointer") which passes tags that are mapped but do
+        // NOT denote a DataType — exactly the case that later crashes
+        // `get_current_size` with `!jl_is_datatype(vt)`.  We now use the EXACT
+        // validity check `get_current_size`/`scan_julia_object` use, exposed via
+        // `VMScanning::debug_object_tag_is_valid` (resolve forwarding → confirm
+        // the tag points to a `jl_datatype_t` whose own tag is the DataType
+        // small-tag and `smalltag()==0`).  This catches the genuine corruption
+        // AT the inc-slot — before the panic — for ALL edge kinds, INCLUDING
+        // `EDGE_KIND_ROOT` (the dangling object is reached as a deep queued
+        // NURSERY/ROOT edge whose storing parent is not yet identified).
+        //
+        // It logs the offending object's tag-at-−8, the slot address, and the
+        // edge kind so the slot can be fed to MMTK_RC_TRACE_ADDRS to find the
+        // missing inc/barrier on the dangling object.  Zero cost when feature
+        // off.
+        #[cfg(feature = "lxr_rc_trace")]
+        {
+            if !VM::VMScanning::debug_object_tag_is_valid(o) {
+                // Rate-limit: the per-event heap-wide referrer scan is O(heap)
+                // and there can be many events, so only do the full scan for
+                // the first CORRUPT_SCAN_LIMIT events; afterwards just log.
+                let n = CORRUPT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < CORRUPT_LOG_LIMIT {
+                    let tag_addr = o.to_raw_address() - 8usize;
+                    let tag: usize = if tag_addr.is_mapped() {
+                        unsafe { tag_addr.load::<usize>() }
+                    } else {
+                        0
+                    };
+                    let kind_str = match K {
+                        EDGE_KIND_ROOT => "ROOT",
+                        EDGE_KIND_NURSERY => "NURSERY",
+                        EDGE_KIND_MATURE => "MATURE",
+                        _ => "UNKNOWN",
+                    };
+                    eprintln!(
+                        "[rc-trace gc={} CORRUPT inc-on-bad-tag #{}] obj={:#x} tag@-8={:#x} rc={} slot={:#x} slot_dbg={:?} kind={} depth={} desc={} — live slot references a FREED/corrupt object",
+                        rc_trace_gc(),
+                        n,
+                        o.to_raw_address(),
+                        tag,
+                        if self.object_has_rc_metadata(o) { self.rc.count(o) as isize } else { -1 },
+                        s.to_address().as_usize(),
+                        s,
+                        kind_str,
+                        depth,
+                        VM::VMScanning::debug_describe_object(o),
+                    );
+                    if n < CORRUPT_SCAN_LIMIT {
+                        // Find who else points at this corrupt object.
+                        scan_heap_referrers(o, self.lxr);
+                    }
+                }
+            }
+        }
         let new = self.process_inc_and_evacuate(o, depth);
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
@@ -812,22 +1675,48 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     #[cold]
     fn process_dead_object(&mut self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        // === Per-object RC trace: death event ===
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced(o) {
+            let obj_addr = o.to_raw_address();
+            let vtag: usize = if (obj_addr - 8usize).is_mapped() {
+                unsafe { (obj_addr - 8usize).load::<usize>() }
+            } else {
+                0xDEAD
+            };
+            let size = if obj_addr.is_mapped() {
+                o.get_size::<VM>()
+            } else {
+                0
+            };
+            eprintln!(
+                "[rc-trace gc={} death] {:#x} vtag={:#x} size={} — THIS OBJECT IS BEING FREED",
+                rc_trace_gc(),
+                obj_addr,
+                vtag,
+                size
+            );
+            // Reverse-reference scan: walk the entire live heap (Immix + LOS)
+            // and report every live object that still holds a pointer to the
+            // dying object.  This deterministically enumerates the heap
+            // referrers of the dying object — i.e. the "untracked referrer"
+            // the §2.15 handoff asks us to find.  If this reports ZERO heap
+            // referrers, the dangling pointer is a C stack local (a missing
+            // GC root), not a missing write barrier.
+            scan_heap_referrers(o, lxr);
+        }
+        // === Death-time genuine-undercount detector (§2.17) ===
+        // For EVERY death (not just MMTK_RC_TRACE_ADDRS ones), if enabled via
+        // MMTK_RC_UNDERCOUNT_BUDGET/_FROM_GC, scan the live heap for a
+        // referrer; report only deaths that still have a LIVE referrer (the
+        // genuine RC undercount).  Near-zero cost when disabled.
+        #[cfg(feature = "lxr_rc_trace")]
+        detect_death_undercount(o, lxr);
         // === RC death diagnostic instrumentation ===
-        // Log vtag, address, size, space, and GC cycle for the first DEATH_LOG_LIMIT dying objects.
-        // The vtag is at object_address - 8 (Julia's tag word preceding the object).
-        // For Julia objects:
-        //   - Small type tags (< 0x100): shifted tag value (e.g., 0x50 = simplevector, 0x90 = svec, 0xa0 = genericmemory)
-        //   - Large values: pointer to jl_datatype_t
-        //
-        // For BindingPartition objects (vtag = jl_binding_partition_type), also log:
-        //   - restriction field (offset +0):  the value/binding this partition resolves to
-        //   - kind field       (offset +8):  partition kind flags
-        //   - min_world        (offset +16): _Atomic min world age
-        //   - max_world        (offset +24): _Atomic max world age
-        //   - next             (offset +32): _Atomic pointer to next partition in linked list
-        // This helps diagnose whether the partition was orphaned (next != NULL but
-        // nothing points to it) or whether the parent Binding's partitions field was
-        // overwritten without a barrier.
+        // Gated behind the `lxr_rc_death_diag` feature flag to avoid
+        // eprintln! calls on the hot path in production builds.
+        // Enable with: --features lxr_rc_death_diag
+        #[cfg(feature = "lxr_rc_death_diag")]
         {
             let n = DEATH_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let gc_cycle = GC_CYCLE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -945,6 +1834,13 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         if has_rc_metadata(x, lxr) {
                             let rc = self.rc.count(x);
                             if rc != MAX_REF_COUNT && rc != 0 {
+                                #[cfg(feature = "lxr_rc_trace")]
+                                if is_rc_traced(x) {
+                                    eprintln!(
+                                        "[rc-trace gc={} rec-dec] {:#x} from dying parent={:#x} slot={:?} child_rc={}",
+                                        rc_trace_gc(), x.to_raw_address(), o.to_raw_address(), slot, rc
+                                    );
+                                }
                                 self.recursive_dec(x);
                             }
                         }
@@ -1005,11 +1901,29 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             let in_los = !in_immix && lxr.los().in_space(*o);
             if !in_immix && !in_los {
                 // Not in any RC-tracked space (VM space, immortal, etc.)
+                #[cfg(feature = "lxr_rc_trace")]
+                if is_rc_traced(*o) {
+                    eprintln!(
+                        "[rc-trace gc={} dec-skip] {:#x} (not in Immix/LOS — no RC metadata)",
+                        rc_trace_gc(),
+                        o.to_raw_address()
+                    );
+                }
                 continue;
             }
             if self.rc.is_dead_or_stuck(*o)
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
+                #[cfg(feature = "lxr_rc_trace")]
+                if is_rc_traced(*o) {
+                    let rc_val = self.rc.count(*o);
+                    let is_dead = self.rc.is_dead_or_stuck(*o);
+                    let not_marked = self.mature_sweeping_in_progress && !lxr.is_marked(*o);
+                    eprintln!(
+                        "[rc-trace gc={} dec-skip] {:#x} rc={} dead_or_stuck={} mature_sweep_unmarked={}",
+                        rc_trace_gc(), o.to_raw_address(), rc_val, is_dead, not_marked
+                    );
+                }
                 continue;
             }
             // Guard: only Immix objects have LOCAL_FORWARDING_BITS_SPEC metadata.
@@ -1024,6 +1938,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             } else {
                 *o
             };
+            #[cfg(feature = "lxr_rc_trace")]
+            let rc_before_dec = if is_rc_traced(o) { self.rc.count(o) } else { 0 };
             let mut dead = false;
             let mut is_los = false;
             let result = self.rc.clone().fetch_update(o, |c| {
@@ -1038,6 +1954,19 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     Some(c - 1)
                 }
             });
+            #[cfg(feature = "lxr_rc_trace")]
+            if is_rc_traced(o) {
+                match result {
+                    Ok(old_rc) => eprintln!(
+                        "[rc-trace gc={} dec] {:#x} rc: {} -> {} dead={}",
+                        rc_trace_gc(), o.to_raw_address(), old_rc, old_rc - 1, dead
+                    ),
+                    Err(old_rc) => eprintln!(
+                        "[rc-trace gc={} dec-stuck] {:#x} rc: {} (stuck/zero, not decremented) dead={}",
+                        rc_trace_gc(), o.to_raw_address(), old_rc, dead
+                    ),
+                }
+            }
             if result == Ok(1) && is_los {
                 lxr.los().rc_free(o);
             }
@@ -1054,7 +1983,10 @@ impl<VM: VMBinding> GCWork<VM> for ProcessDecs<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         // Increment GC cycle counter on the first ProcessDecs packet of each cycle.
         // This is approximate (multiple packets per cycle) but sufficient for diagnostics.
+        #[cfg(feature = "lxr_rc_death_diag")]
         GC_CYCLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "lxr_rc_trace")]
+        rc_trace_inc_gc_count();
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         self.mark_dead_objects = if crate::args::LAZY_DECREMENTS {
             lxr.cm_in_progress() && lxr.previous_pause() != Some(Pause::InitialMark)
@@ -1143,3 +2075,10 @@ impl<VM: VMBinding> DerefMut for RCImmixCollectRootEdges<VM> {
         &mut self.base
     }
 }
+
+// NOTE: A remembered non-heap-buffer owner re-scan (HANDOFF §2.13 option (b))
+// was prototyped here and removed in favour of the LOS-routing fix: pointer-
+// bearing GenericMemory buffers are now allocated inline in the MMTk heap (LOS),
+// so every reference slot is heap-resident with side metadata and the field-
+// logging barrier works unmodified.  See plan-alloc.md (Phase 1).  Do not
+// re-introduce an owner-rescan / `nonheap_owners` mechanism.

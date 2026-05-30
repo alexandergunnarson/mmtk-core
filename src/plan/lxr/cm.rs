@@ -366,6 +366,13 @@ impl ProcessModBufSATB {
             nodes_arc: None,
         }
     }
+    // Canonical LXR dual-mode constructor (paired with `nodes_arc` / the
+    // `LXRConcurrentTraceObjects::new_arc` path in `do_work`).  Not currently
+    // called in the Julia fork — A1-defer's `flush_decs_and_satb` builds the
+    // SATB packet from a plain `Vec` (`new`) because the barrier decs are no
+    // longer Arc-shared with a same-cycle `ProcessDecs`.  Retained rather than
+    // pruned to avoid diverging the canonical SATB type.
+    #[allow(dead_code)]
     pub fn new_arc(nodes: Arc<Vec<ObjectReference>>) -> Self {
         // crate::NUM_CONCURRENT_TRACING_PACKETS.fetch_add(1, Ordering::SeqCst);
         Self {

@@ -1,7 +1,5 @@
 //! Read/Write barrier implementations.
 
-use std::sync::Arc;
-
 use atomic::Ordering;
 
 use super::LXR;
@@ -11,7 +9,6 @@ use crate::plan::barriers::UNLOGGED_VALUE;
 use crate::plan::barriers::{FAST_COUNT, SLOW_COUNT};
 use crate::plan::immix::Pause;
 use crate::plan::lxr::cm::ProcessModBufSATB;
-use crate::plan::lxr::rc::ProcessDecs;
 use crate::plan::lxr::rc::ProcessIncs;
 use crate::plan::lxr::rc::EDGE_KIND_MATURE;
 use crate::plan::VectorQueue;
@@ -24,8 +21,10 @@ use crate::util::*;
 use crate::vm::slot::MemorySlice;
 use crate::vm::slot::Slot;
 use crate::vm::*;
-use crate::LazySweepingJobsCounter;
 use crate::MMTK;
+
+#[cfg(feature = "lxr_rc_trace")]
+use super::rc::{is_rc_traced, rc_trace_gc};
 
 pub const TAKERATE_MEASUREMENT: bool = false;
 
@@ -103,14 +102,103 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
     ) {
         // Reference counting
         if let Some(old) = old {
+            #[cfg(feature = "lxr_rc_trace")]
+            if is_rc_traced(old) {
+                eprintln!(
+                    "[rc-trace gc={} barrier-dec] {:#x} slot={:?} src={:?} (old value pushed to decs)",
+                    rc_trace_gc(),
+                    old.to_raw_address(),
+                    slot,
+                    _src.map(|s| s.to_raw_address()),
+                );
+            }
             self.decs.push(old);
             if self.decs.is_full() {
                 self.flush_decs_and_satb();
             }
         }
+        // Trace the new value that will be loaded from the slot at GC time
+        #[cfg(feature = "lxr_rc_trace")]
+        if let Some(new_obj) = slot.load() {
+            if is_rc_traced(new_obj) {
+                eprintln!(
+                    "[rc-trace gc={} barrier-inc] {:#x} slot={:?} src={:?} (slot pushed to incs)",
+                    rc_trace_gc(),
+                    new_obj.to_raw_address(),
+                    slot,
+                    _src.map(|s| s.to_raw_address()),
+                );
+            }
+        }
         self.incs.push(slot);
         if self.incs.is_full() {
             self.flush_incs();
+        }
+    }
+
+    /// Push a non-heap slot write (old, new) pair directly into the barrier's
+    /// inc/dec queues.  Called from the binding's FFI for non-heap slots
+    /// (external GenericMemory data buffers with how != 0) where the caller
+    /// has already read the old value from the slot before the store.
+    ///
+    /// The `new_slot` should be a `Direct(new_val)` variant so that
+    /// `ProcessIncs` captures the value at barrier time without re-reading
+    /// the slot (which avoids RC overcount from duplicate reads).
+    ///
+    /// This goes through the same inc/dec queues as the regular barrier,
+    /// so buffers are flushed by `Mutator::flush()` during STW — no need
+    /// for separate thread-local buffers or manual flush calls.
+    pub fn push_nonheap_write(&mut self, old: Option<ObjectReference>, new_slot: VM::VMSlot) {
+        if let Some(old) = old {
+            #[cfg(feature = "lxr_rc_trace")]
+            if is_rc_traced(old) {
+                eprintln!(
+                    "[rc-trace gc={} nonheap-dec] {:#x} new_slot={:?} (old value pushed to decs from non-heap write)",
+                    rc_trace_gc(),
+                    old.to_raw_address(),
+                    new_slot,
+                );
+            }
+            self.decs.push(old);
+            if self.decs.is_full() {
+                self.flush_decs_and_satb();
+            }
+        }
+        #[cfg(feature = "lxr_rc_trace")]
+        if let Some(new_obj) = new_slot.load() {
+            if is_rc_traced(new_obj) {
+                eprintln!(
+                    "[rc-trace gc={} nonheap-inc] {:#x} slot={:?} (Direct slot pushed to incs from non-heap write)",
+                    rc_trace_gc(),
+                    new_obj.to_raw_address(),
+                    new_slot,
+                );
+            }
+        }
+        self.incs.push(new_slot);
+        if self.incs.is_full() {
+            self.flush_incs();
+        }
+    }
+
+    /// Push a single RC decrement into the barrier's dec queue.  Called from
+    /// the binding's FFI for explicit RC decrements emitted by compiled code
+    /// (e.g. MLIR `julia.rc.dec` ops in Perceus-style RC).
+    ///
+    /// Like `push_nonheap_write`, this uses the mutator's own dec queue,
+    /// so it is flushed automatically by `Mutator::flush()` during STW.
+    pub fn push_dec(&mut self, obj: ObjectReference) {
+        #[cfg(feature = "lxr_rc_trace")]
+        if is_rc_traced(obj) {
+            eprintln!(
+                "[rc-trace gc={} explicit-dec] {:#x} (explicit RC dec from compiled code)",
+                rc_trace_gc(),
+                obj.to_raw_address(),
+            );
+        }
+        self.decs.push(obj);
+        if self.decs.is_full() {
+            self.flush_decs_and_satb();
         }
     }
 
@@ -199,20 +287,49 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
     #[cold]
     fn flush_decs_and_satb(&mut self) {
         if !self.decs.is_empty() {
-            let w = if self.should_create_satb_packets() {
-                let decs = Arc::new(self.decs.take());
+            // Inc-before-dec ordering fix — A1-defer (HANDOFF §2.18, Julia LXR):
+            //
+            // Barrier-generated decrements MUST NOT free an object before the
+            // PARTNER increment of the same field-logging event has been
+            // applied.  For a net-zero (same-value) slot overwrite the barrier
+            // records a coalesced `dec(old) + inc(slot)` of the SAME object; if
+            // the dec runs first it can drop the object's RC to 0 and
+            // recursively free its children before the inc resurrects it,
+            // leaving a live object holding dangling pointers (the
+            // `promo-child-bad-tag` corruption on boxed `GenericMemory{Any}`
+            // containers during `Compiler.bootstrap!()`).
+            //
+            // The original code routed barrier decs to `postpone_prioritized`,
+            // which is swapped into the always-open `Unconstrained` queue and
+            // drained in the concurrent window BEFORE the next pause's incs —
+            // inverting the ordering.
+            //
+            // A1-defer fixes this by giving barrier decs the SAME one-epoch
+            // deferral that root decs already use (and which makes root decs
+            // immune to this inversion): the dec batch is recorded in the
+            // plan's `curr_barrier_decs` queue here, swapped curr→prev in
+            // `LXR::release`, and only scheduled (concurrently, via
+            // `process_prev_barrier_decs` → `postpone_all_prioritized`) at the
+            // NEXT pause.  A barrier dec is therefore applied a full epoch after
+            // its partner inc (applied in the prior pause's `RCProcessIncs`), so
+            // inc-before-dec always holds — while the decs stay fully
+            // CONCURRENT (no added pause time), unifying barrier-dec ordering
+            // with the root-dec model.
+            //
+            // The SATB modbuf snapshot is independent of dec timing: it belongs
+            // to the CURRENT marking cycle and is still flushed immediately to
+            // `FinishConcurrentWork`.
+            //
+            // Perf: the common (non-SATB) RC-pause path moves the `Vec` into
+            // `curr_barrier_decs` with no allocation (matching canonical LXR's
+            // plain-`Vec` dec path).  Only the rare concurrent-marking path
+            // pays for a SATB snapshot copy.
+            let decs = self.decs.take();
+            if self.should_create_satb_packets() {
                 self.mmtk.scheduler.work_buckets[WorkBucketStage::FinishConcurrentWork]
-                    .add(ProcessModBufSATB::new_arc(decs.clone()));
-                ProcessDecs::new_arc(decs, LazySweepingJobsCounter::new_decs())
-            } else {
-                let decs = self.decs.take();
-                ProcessDecs::new(decs, LazySweepingJobsCounter::new_decs())
-            };
-            if crate::args::LAZY_DECREMENTS {
-                self.mmtk.scheduler.postpone_prioritized(w);
-            } else {
-                self.mmtk.scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].add(w);
+                    .add(ProcessModBufSATB::new(decs.clone()));
             }
+            self.lxr.curr_barrier_decs.read().unwrap().push(decs);
         }
     }
 
@@ -294,6 +411,14 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
         old: Option<ObjectReference>,
         _new: Option<ObjectReference>,
     ) {
+        // Same-value cmpswap (old == new): a successful CAS that wrote back the
+        // identical reference changes no references, so the coalesced
+        // dec(old)+inc(new) is pure overhead AND the net-zero re-store race
+        // trigger (HANDOFF §2.18 (B)).  Both values are explicit caller
+        // parameters here, so the comparison is exact and free.
+        if old == _new {
+            return;
+        }
         // Heap range check: skip slots outside the managed heap (no metadata).
         {
             use crate::util::heap::layout::vm_layout::vm_layout;

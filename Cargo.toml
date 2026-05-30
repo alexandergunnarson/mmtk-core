@@ -170,6 +170,17 @@ lxr_no_evac = ["lxr_no_nursery_evac", "lxr_no_mature_evac"]
 ix_always_defrag = []
 lxr_no_prefetch = []
 takerate_measurement = []
+# Enable verbose RC death diagnostic logging in process_dead_object.
+# This adds eprintln! calls on the hot path — do NOT enable in production.
+lxr_rc_death_diag = []
+
+# Enable per-object RC tracing for diagnosing systematic RC undercount.
+# Set MMTK_RC_TRACE_ADDRS=0x...,0x... (comma-separated hex addresses) to
+# trace every RC inc/dec/promote/death for those specific objects.
+# Workflow: (1) build with lxr_rc_death_diag to find dying addresses,
+# (2) rebuild with lxr_rc_trace + MMTK_RC_TRACE_ADDRS to trace them.
+# Hot-path overhead is minimal (one array scan per RC op, only when enabled).
+lxr_rc_trace = []
 
 # This feature is only supported on x86-64 for now
 # It's manually added to CI scripts

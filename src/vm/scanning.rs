@@ -271,6 +271,39 @@ pub trait Scanning<VM: VMBinding> {
         unreachable!()
     }
 
+    /// Diagnostic-only (feature `lxr_rc_trace`): return a human-readable
+    /// description of an object for corruption tracing.  Used by LXR's
+    /// nursery-promotion corruption guard to identify a misclassified parent
+    /// array (its resolved type name, array layout flags, `how`, length, and a
+    /// sample of its first data words).  Zero cost when the feature is off.
+    #[cfg(feature = "lxr_rc_trace")]
+    fn debug_describe_object(_o: ObjectReference) -> String {
+        String::new()
+    }
+
+    /// Diagnostic-only (feature `lxr_rc_trace`): return true if the object's
+    /// type tag is a plausible, valid type (for the VM's notion of "valid").
+    /// Used by LXR's nursery-promotion corruption guard to detect a slot that
+    /// references a freed/reused object whose type tag no longer denotes a
+    /// valid type — the signature of an RC undercount.  A return of `false`
+    /// means the object is corrupt.  Zero cost when the feature is off.
+    #[cfg(feature = "lxr_rc_trace")]
+    fn debug_object_tag_is_valid(_o: ObjectReference) -> bool {
+        true
+    }
+
+    /// Diagnostic-only (feature `lxr_rc_trace`): return the object's type name
+    /// using ONLY single-word reads (the tag at `-8` and the typename symbol),
+    /// WITHOUT traversing the type layout or any data fields.  Safe to call on
+    /// a candidate object-start during a mid-sweep heap walk (where reading the
+    /// full layout via `debug_describe_object`/`get_size` may fault on a
+    /// partially-freed object).  Returns an empty string for an invalid tag.
+    /// Zero cost when the feature is off.
+    #[cfg(feature = "lxr_rc_trace")]
+    fn debug_object_type_name(_o: ObjectReference) -> String {
+        String::new()
+    }
+
     /// MMTk calls this method at the first time during a collection that thread's stacks
     /// have been scanned. This can be used (for example) to clean up
     /// obsolete compiled methods that are no longer being executed.

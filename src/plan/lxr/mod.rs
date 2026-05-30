@@ -1,4 +1,4 @@
-mod barrier;
+pub mod barrier;
 pub(super) mod cm;
 mod gc_work;
 pub(super) mod global;

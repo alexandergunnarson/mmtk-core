@@ -1,4 +1,3 @@
-use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::mmtk::SFT_MAP;
 use crate::plan::{ObjectQueue, VectorObjectQueue};
 use crate::policy::sft::GCWorkerMutRef;
@@ -11,6 +10,7 @@ use crate::util::heap::externalpageresource::{ExternalPageResource, ExternalPage
 use crate::util::heap::layout::vm_layout::BYTES_IN_CHUNK;
 use crate::util::heap::PageResource;
 use crate::util::metadata::mark_bit::MarkState;
+use crate::util::metadata::side_metadata::SideMetadataContext;
 #[cfg(feature = "set_unlog_bits_vm_space")]
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ObjectEnumerator;
@@ -135,16 +135,16 @@ impl<VM: VMBinding> Space<VM> for VMSpace<VM> {
         }
     }
 
-
     /// Override the default verify_side_metadata_sanity to use VMSpace's own metadata
     /// context instead of the ExternalPageResource's (which has empty global specs).
     /// This is needed because ExternalPageResource::new initializes with empty
     /// SideMetadataContext, but VMSpace stores the correct metadata separately.
-    fn verify_side_metadata_sanity(&self, side_metadata_sanity_checker: &mut crate::util::metadata::side_metadata::SideMetadataSanity) {
-        side_metadata_sanity_checker.verify_metadata_context(
-            std::any::type_name::<Self>(),
-            &self.metadata,
-        )
+    fn verify_side_metadata_sanity(
+        &self,
+        side_metadata_sanity_checker: &mut crate::util::metadata::side_metadata::SideMetadataSanity,
+    ) {
+        side_metadata_sanity_checker
+            .verify_metadata_context(std::any::type_name::<Self>(), &self.metadata)
     }
 
     fn release_multiple_pages(&mut self, _start: Address) {
@@ -218,11 +218,7 @@ impl<VM: VMBinding> VMSpace<VM> {
         let space = Self {
             mark_state: MarkState::new(),
             pr: ExternalPageResource::new(args.vm_map),
-            common: CommonSpace::new(args.into_policy_args(
-                false,
-                true,
-                local_specs,
-            )),
+            common: CommonSpace::new(args.into_policy_args(false, true, local_specs)),
             metadata,
         };
 
@@ -287,6 +283,24 @@ impl<VM: VMBinding> VMSpace<VM> {
             // Bulk set unlog bits for all addresses in the VM space. This ensures that any
             // modification to the bootimage is logged
             if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC {
+                side.bset_metadata(start, size);
+            }
+            // LXR uses a FIELD-level unlog bit (a SEPARATE side-metadata spec
+            // from the object-level GLOBAL_LOG_BIT_SPEC above) for its
+            // field-logging write barrier.  The sysimage (bootimage) is loaded
+            // into the VM space, but its field unlog bits default to 0
+            // ("logged") — so the barrier SKIPS every store into a sysimage
+            // field.  When a sysimage object IS mutated at runtime (e.g. a
+            // method-table cache in the bootimage gaining a new TypeMapEntry,
+            // or a Binding's partition chain being extended), the new young
+            // object stored into that field is therefore NEVER RC-incremented
+            // → it is reclaimed while still live-referenced from the sysimage
+            // (a genuine RC undercount: HANDOFF §2.18 Class A).  Bulk-set the
+            // field-level unlog bits to "unlogged" (1) across the whole VM
+            // space, exactly as we do for the object-level bit above, so the
+            // LXR field barrier fires on the first mutation of any sysimage
+            // field and correctly increments the stored object.
+            if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC {
                 side.bset_metadata(start, size);
             }
         }

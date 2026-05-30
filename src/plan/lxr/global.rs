@@ -89,6 +89,19 @@ pub struct LXR<VM: VMBinding> {
     in_concurrent_marking: AtomicBool,
     pub prev_roots: RwLock<SegQueue<Vec<ObjectReference>>>,
     pub curr_roots: RwLock<SegQueue<Vec<ObjectReference>>>,
+    // Barrier-generated decrements, deferred one full epoch (A1-defer, HANDOFF
+    // §2.18).  `flush_decs_and_satb` pushes each barrier-dec batch (the OLD
+    // values logged by the field barrier) into `curr_barrier_decs` instead of
+    // scheduling a `ProcessDecs` immediately.  At the next pause `release` swaps
+    // curr→prev (mirroring `curr_roots`/`prev_roots`) and
+    // `process_prev_barrier_decs` schedules the previous epoch's decs onto the
+    // concurrent path.  Because a barrier dec is thus applied a FULL epoch
+    // after its partner inc (which was applied in the prior pause's
+    // `RCProcessIncs`), the inc-before-dec invariant holds even for net-zero
+    // (same-value) slot overwrites — yet the decs stay concurrent (no added
+    // pause time), unifying barrier-dec ordering with the root-dec model.
+    pub prev_barrier_decs: RwLock<SegQueue<Vec<ObjectReference>>>,
+    pub curr_barrier_decs: RwLock<SegQueue<Vec<ObjectReference>>>,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
 }
@@ -294,6 +307,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         let mut curr_roots = self.curr_roots.write().unwrap();
         std::mem::swap::<SegQueue<_>>(&mut prev_roots, &mut curr_roots);
         debug_assert!(curr_roots.is_empty());
+        // swap barrier decs (A1-defer, HANDOFF §2.18) — same one-epoch deferral
+        // as roots so barrier decs are always applied after their partner incs.
+        let mut prev_barrier_decs = self.prev_barrier_decs.write().unwrap();
+        let mut curr_barrier_decs = self.curr_barrier_decs.write().unwrap();
+        std::mem::swap::<SegQueue<_>>(&mut prev_barrier_decs, &mut curr_barrier_decs);
+        debug_assert!(curr_barrier_decs.is_empty());
         Block::update_global_phase_epoch(&self.immix_space);
     }
 
@@ -465,6 +484,8 @@ impl<VM: VMBinding> LXR<VM> {
             in_concurrent_marking: AtomicBool::new(false),
             prev_roots: Default::default(),
             curr_roots: Default::default(),
+            prev_barrier_decs: Default::default(),
+            curr_barrier_decs: Default::default(),
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
         });
@@ -714,6 +735,13 @@ impl<VM: VMBinding> LXR<VM> {
         scheduler.work_buckets[WorkBucketStage::RefForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
+        // Canonical LXR: under LAZY_DECREMENTS, STWRCDecsAndSweep is only needed
+        // for Full GC.  A1-defer (HANDOFF §2.18) defers barrier decs one epoch
+        // onto the CONCURRENT path (`process_prev_barrier_decs` →
+        // `postpone_all_prioritized`), exactly like root decs, so they no longer
+        // need this STW bucket for RC/InitialMark/FinalMark pauses.  (A1-STW
+        // previously kept it enabled to receive barrier decs STW; A1-defer
+        // restores the canonical disabling and the lost concurrency.)
         if crate::args::LAZY_DECREMENTS && pause != Pause::Full {
             scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].set_enabled(false);
         }
@@ -727,6 +755,8 @@ impl<VM: VMBinding> LXR<VM> {
         type E<VM> = RCImmixCollectRootEdges<VM>;
         // Before start yielding, wrap all the roots from the previous GC with work-packets.
         self.process_prev_roots(scheduler);
+        // Likewise schedule the previous epoch's deferred barrier decs (A1-defer).
+        self.process_prev_barrier_decs(scheduler);
         // Stop & scan mutators (mutator scanning can happen before STW)
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add_prioritized(Box::new(StopMutators::<LXRGCWorkContext<E<VM>>>::new()));
@@ -740,6 +770,7 @@ impl<VM: VMBinding> LXR<VM> {
     fn schedule_concurrent_marking_initial_pause(&'static self, scheduler: &GCWorkScheduler<VM>) {
         self.disable_unnecessary_buckets(scheduler, Pause::InitialMark);
         self.process_prev_roots(scheduler);
+        self.process_prev_barrier_decs(scheduler);
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add_prioritized(Box::new(
             StopMutators::<LXRGCWorkContext<RCImmixCollectRootEdges<VM>>>::new(),
         ));
@@ -755,6 +786,7 @@ impl<VM: VMBinding> LXR<VM> {
             crate::MOVE_CONCURRENT_MARKING_TO_STW.store(true, Ordering::SeqCst);
         }
         self.process_prev_roots(scheduler);
+        self.process_prev_barrier_decs(scheduler);
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add_prioritized(Box::new(
             StopMutators::<LXRGCWorkContext<RCImmixCollectRootEdges<VM>>>::new(),
         ));
@@ -774,6 +806,7 @@ impl<VM: VMBinding> LXR<VM> {
         self.disable_unnecessary_buckets(scheduler, Pause::Full);
         // Before start yielding, wrap all the roots from the previous GC with work-packets.
         self.process_prev_roots(scheduler);
+        self.process_prev_barrier_decs(scheduler);
         // Stop & scan mutators (mutator scanning can happen before STW)
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add_prioritized(Box::new(StopMutators::<LXRGCWorkContext<E>>::new()));
@@ -800,6 +833,34 @@ impl<VM: VMBinding> LXR<VM> {
                 vec![],
                 LazySweepingJobsCounter::new_decs(),
             )));
+        }
+        if crate::args::LAZY_DECREMENTS {
+            scheduler.postpone_all_prioritized(work_packets);
+        } else {
+            scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].bulk_add(work_packets);
+        }
+    }
+
+    /// Schedule the previous epoch's barrier-generated decrements (A1-defer,
+    /// HANDOFF §2.18).  Mirrors `process_prev_roots`: the barrier decs recorded
+    /// during epoch N (and swapped curr→prev in `release`) are turned into
+    /// `ProcessDecs` packets here, at the START of pause N+1's scheduling, and
+    /// dispatched to the concurrent path (`postpone_all_prioritized`).  They
+    /// therefore drain in the concurrent window AFTER pause N+1's incs — a full
+    /// epoch after their partner incs were applied in pause N — so the
+    /// inc-before-dec invariant holds without making the decs stop-the-world.
+    fn process_prev_barrier_decs(&self, scheduler: &GCWorkScheduler<VM>) {
+        let prev_barrier_decs = self.prev_barrier_decs.write().unwrap();
+        let mut work_packets: Vec<Box<dyn GCWork<VM>>> =
+            Vec::with_capacity(prev_barrier_decs.len());
+        while let Some(decs) = prev_barrier_decs.pop() {
+            work_packets.push(Box::new(ProcessDecs::new(
+                decs,
+                LazySweepingJobsCounter::new_decs(),
+            )))
+        }
+        if work_packets.is_empty() {
+            return;
         }
         if crate::args::LAZY_DECREMENTS {
             scheduler.postpone_all_prioritized(work_packets);

@@ -6,9 +6,9 @@ use crate::util::heap::chunk_map::Chunk;
 use crate::util::linear_scan::{Region, RegionIterator};
 use crate::util::metadata::side_metadata::spec_defs::{BLOCK_IN_USE, BLOCK_OWNER};
 use crate::util::metadata::side_metadata::*;
-use crate::util::metadata::MetadataSpec;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
+use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::BlockMayHaveObjects;
 use crate::util::{constants::*, OpaquePointer, VMThread};
 use crate::util::{Address, ObjectReference};
