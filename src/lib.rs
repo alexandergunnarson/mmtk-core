@@ -60,7 +60,7 @@ mod global_state;
 pub use crate::global_state::LiveBytesStats;
 
 #[macro_use]
-mod policy;
+pub mod policy;
 
 pub mod args;
 pub mod build_info;

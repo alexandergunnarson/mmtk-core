@@ -108,6 +108,9 @@ impl<VM: VMBinding> GCTrigger<VM> {
     /// * `space_full`: Space request failed, must recover pages within 'space'.
     /// * `space`: The space that triggered the poll. This could `None` if the poll is not triggered by a space.
     pub fn poll(&self, space_full: bool, space: Option<&dyn Space<VM>>) -> bool {
+        if *self.options.ignore_system_gc {
+            return false;
+        }
         if !VM::VMCollection::is_collection_enabled() {
             return false;
         }

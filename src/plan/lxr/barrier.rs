@@ -12,6 +12,7 @@ use crate::plan::lxr::cm::ProcessModBufSATB;
 use crate::plan::lxr::rc::ProcessIncs;
 use crate::plan::lxr::rc::EDGE_KIND_MATURE;
 use crate::plan::VectorQueue;
+use crate::policy::space::Space;
 use crate::scheduler::WorkBucketStage;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
@@ -33,7 +34,7 @@ pub struct LXRFieldBarrierSemantics<VM: VMBinding> {
     incs: VectorQueue<VM::VMSlot>,
     decs: VectorQueue<ObjectReference>,
     refs: VectorQueue<ObjectReference>,
-    lxr: &'static LXR<VM>,
+    pub lxr: &'static LXR<VM>,
 }
 
 impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
@@ -228,6 +229,22 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
                 if TAKERATE_MEASUREMENT && self.mmtk.inside_harness() {
                     SLOW_COUNT.fetch_add(1, Ordering::SeqCst);
                 }
+                let is_nursery = if let Some(parent) = src {
+                    if self
+                        .lxr
+                        .immix_space
+                        .address_in_space(parent.to_raw_address())
+                    {
+                        crate::policy::immix::block::Block::containing(parent).is_nursery_mutator()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_nursery {
+                    return true;
+                }
                 self.slow(src, slot, old);
                 true
             } else {
@@ -260,6 +277,22 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             // store is valid (writable malloc'd memory, but nursery evac
             // is disabled so objects are never moved).
             let old = slot.load();
+            let is_nursery = if let Some(parent) = src {
+                if self
+                    .lxr
+                    .immix_space
+                    .address_in_space(parent.to_raw_address())
+                {
+                    crate::policy::immix::block::Block::containing(parent).is_nursery_mutator()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if is_nursery {
+                return true;
+            }
             self.slow(src, slot, old);
             true
         }

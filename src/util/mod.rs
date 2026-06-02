@@ -57,7 +57,7 @@ pub(crate) mod finalizable_processor;
 pub(crate) mod logger;
 pub(crate) mod object_enum;
 /// Forwarding word in object copying.
-pub(crate) mod object_forwarding;
+pub mod object_forwarding;
 /// Reference processing implementation.
 pub(crate) mod reference_processor;
 /// Utilities funcitons for Rust

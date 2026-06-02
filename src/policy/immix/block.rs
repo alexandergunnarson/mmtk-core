@@ -192,6 +192,7 @@ impl Block {
 
     /// Get the block containing the given address.
     /// The input address does not need to be aligned.
+    #[inline(always)]
     pub fn containing(object: ObjectReference) -> Self {
         Self(object.to_raw_address().align_down(Self::BYTES))
     }
@@ -309,6 +310,7 @@ impl Block {
     /// The global phase epoch.
     /// This counter is bumped by one at the end of every mutator and GC phase.
     /// Any block matching this epoch are used for allocation in the current phase.
+    #[inline(always)]
     pub fn global_phase_epoch() -> u8 {
         GLOBAL_PHASE_EPOCH.load(Ordering::Relaxed)
     }
@@ -319,6 +321,7 @@ impl Block {
     ///
     /// Odd epoch means the block is in a mutator phase.
     /// Even epoch means the block is allocated in a GC phase.
+    #[inline(always)]
     pub fn phase_epoch(&self) -> u8 {
         Self::PHASE_EPOCH.load_atomic::<u8>(self.start(), Ordering::Relaxed)
     }
@@ -345,10 +348,20 @@ impl Block {
         e == ge
     }
 
+    #[inline(always)]
     pub fn is_nursery(&self) -> bool {
         self.get_state() == BlockState::Unallocated && self.is_nursery_or_reusing()
     }
 
+    #[inline(always)]
+    pub fn is_nursery_mutator(&self) -> bool {
+        Self::MARK_TABLE.load_atomic::<u8>(self.start(), Ordering::Relaxed)
+            == BlockState::MARK_UNALLOCATED
+            && Self::PHASE_EPOCH.load_atomic::<u8>(self.start(), Ordering::Relaxed)
+                == Self::global_phase_epoch()
+    }
+
+    #[inline(always)]
     pub fn is_nursery_or_reusing(&self) -> bool {
         let ge = Self::global_phase_epoch();
         let e = self.phase_epoch();
@@ -382,6 +395,7 @@ impl Block {
     }
 
     /// Get block mark state.
+    #[inline(always)]
     pub fn get_state(&self) -> BlockState {
         let byte = Self::MARK_TABLE.load_atomic::<u8>(self.start(), Ordering::SeqCst);
         byte.into()

@@ -133,6 +133,12 @@ pub trait Slot: Copy + Send + Debug + PartialEq + Eq + Hash {
     /// See: <https://github.com/mmtk/mmtk-core/issues/1038>
     fn store(&self, object: ObjectReference);
 
+    /// Return true if this is a TypeTag slot (identifying a class pointer/TypeTag).
+    #[inline(always)]
+    fn is_type_tag(&self) -> bool {
+        false
+    }
+
     /// Prefetch the slot so that a subsequent `load` will be faster.
     fn prefetch_load(&self) {
         // no-op by default

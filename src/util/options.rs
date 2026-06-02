@@ -737,8 +737,22 @@ impl FromStr for GCTriggerSelector {
             return Err("No GC trigger policy is supplied".to_string());
         }
 
-        if s.starts_with("FixedHeapSize") || s.starts_with("DynamicHeapSize") {
-            unimplemented!()
+        if s.starts_with("FixedHeapSize:") {
+            let size_str = s.strip_prefix("FixedHeapSize:").unwrap();
+            let size = Self::parse_size(size_str)?;
+            return Ok(Self::FixedHeapSize(size));
+        } else if s.starts_with("DynamicHeapSize:") {
+            let bounds_str = s.strip_prefix("DynamicHeapSize:").unwrap();
+            let parts: Vec<&str> = bounds_str.split(',').collect();
+            if parts.len() != 2 {
+                return Err(
+                    "DynamicHeapSize requires min and max bounds: DynamicHeapSize:min,max"
+                        .to_string(),
+                );
+            }
+            let min = Self::parse_size(parts[0])?;
+            let max = Self::parse_size(parts[1])?;
+            return Ok(Self::DynamicHeapSize(min, max));
         } else if s.starts_with("Delegated") {
             return Ok(Self::Delegated);
         }

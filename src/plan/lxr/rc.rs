@@ -1060,6 +1060,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if los {
             return true;
         }
+        // Safety check: Never evacuate/forward non-heap/static/system-image objects!
+        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            return true;
+        }
         // Skip mature object
         if self.rc.count(o) != 0 {
             return true;
@@ -1086,6 +1090,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     fn process_inc_and_evacuate(&mut self, o: ObjectReference, depth: u32) -> ObjectReference {
         o.verify::<VM>();
+        // Safe Bounds Guard: If the object is not in any active MMTk space, return immediately.
+        // This is 100% bounds-checked and prevents any out-of-bounds SFT dense chunk map segfaults.
+        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            return o;
+        }
         // Guard: skip RC operations for objects not in Immix or LOS space.
         // RC_TABLE side metadata is only mapped for Immix and LOS.  Objects in
         // VM space (sysimage), immortal space, or non-moving space would SIGSEGV
@@ -1094,10 +1103,6 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if !self.object_has_rc_metadata(o) {
             return o;
         }
-        crate::stat(|s| {
-            s.inc_objects += 1;
-            s.inc_volume += o.get_size::<VM>();
-        });
         let los = self.lxr.los().in_space(o);
         if crate::args::RC_NURSERY_EVACUATION
             && !los
@@ -1111,12 +1116,20 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             } else {
                 o
             };
+            crate::stat(|s| {
+                s.inc_objects += 1;
+                s.inc_volume += new.get_size::<VM>();
+            });
             let promoted = self.inc(new);
             if promoted && new == o {
                 self.promote(o, false, los, depth);
             }
             return new;
         }
+        crate::stat(|s| {
+            s.inc_objects += 1;
+            s.inc_volume += o.get_size::<VM>();
+        });
         if !crate::args::RC_NURSERY_EVACUATION || self.dont_evacuate(o, los) {
             if self.inc(o) {
                 self.promote(o, false, los, depth);
@@ -1325,6 +1338,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
         }
         let new = self.process_inc_and_evacuate(o, depth);
+        if s.is_type_tag() {
+            let _ = self.rc.stick(new);
+        }
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
             self.record_mature_evac_remset(s, new);
