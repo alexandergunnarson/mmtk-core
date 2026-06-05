@@ -1060,12 +1060,12 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if los {
             return true;
         }
-        #[cfg(feature = "object_pinning")]
-        if VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.is_object_pinned::<VM>(o) {
-            return true;
-        }
         // Safety check: Never evacuate/forward non-heap/static/system-image objects!
         if !crate::memory_manager::is_in_mmtk_spaces(o) {
+            return true;
+        }
+        #[cfg(feature = "object_pinning")]
+        if VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.is_object_pinned::<VM>(o) {
             return true;
         }
         // Skip mature object
@@ -1342,7 +1342,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
         }
         let new = self.process_inc_and_evacuate(o, depth);
-        if s.is_type_tag() {
+        if s.is_type_tag() && self.object_has_rc_metadata(new) {
             let _ = self.rc.stick(new);
         }
         // Put this into remset if this is a mature slot, or a weak root
