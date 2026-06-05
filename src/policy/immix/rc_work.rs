@@ -198,6 +198,19 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
 
     fn process_dead_object(&mut self, mut o: ObjectReference) {
         o = o.fix_start_address::<VM>();
+        #[cfg(feature = "lxr_rc_trace")]
+        {
+            let tag_addr = o.to_raw_address() - 8usize;
+            if tag_addr.is_mapped() {
+                let raw = unsafe { tag_addr.load::<usize>() };
+                eprintln!(
+                    "[rc-trace sweep-death] {:#x} vtag={:#x} size={} — THIS OBJECT IS BEING SWEPT BY IMMIX",
+                    o.to_raw_address().as_usize(),
+                    raw,
+                    o.get_size::<VM>()
+                );
+            }
+        }
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();

@@ -139,6 +139,13 @@ impl<VM: VMBinding> LXRConcurrentTraceObjects<VM> {
         // (e.g. VM space, immortal space).  Without this, los().trace_object_rc()
         // tries to access unmapped metadata pages → SIGSEGV.
         if !super::rc::has_rc_metadata(object, self.plan) {
+            #[cfg(feature = "vm_space")]
+            if self.plan.common.base.vm_space.in_space(object) {
+                return self.plan.common.base.vm_space.trace_object(self, object);
+            }
+            if self.plan.common.immortal.in_space(object) {
+                return self.plan.common.immortal.trace_object(self, object);
+            }
             return object;
         }
         // Guard: skip objects already freed by RC (RC=0).
@@ -568,6 +575,13 @@ impl<VM: VMBinding, const FULL_GC: bool> LXRStopTheWorldProcessEdges<VM, FULL_GC
         // (rc.count, trace_object_rc, Block::containing) would SIGSEGV on unmapped pages.
         let in_immix = self.lxr.immix_space.in_space(object);
         if !in_immix && !self.lxr.los().in_space(object) {
+            #[cfg(feature = "vm_space")]
+            if self.lxr.common.base.vm_space.in_space(object) {
+                return self.lxr.common.base.vm_space.trace_object(self, object);
+            }
+            if self.lxr.common.immortal.in_space(object) {
+                return self.lxr.common.immortal.trace_object(self, object);
+            }
             return object;
         }
         // WEAK_ROOT defrag-source check only applies to Immix objects — LOS objects
@@ -617,8 +631,16 @@ impl<VM: VMBinding, const FULL_GC: bool> LXRStopTheWorldProcessEdges<VM, FULL_GC
         }
         // Guard: skip objects not in Immix/LOS — they have no RC_TABLE metadata
         if !super::rc::has_rc_metadata(object, self.lxr) {
+            #[cfg(feature = "vm_space")]
+            if self.lxr.common.base.vm_space.in_space(object) {
+                return self.lxr.common.base.vm_space.trace_object(self, object);
+            }
+            if self.lxr.common.immortal.in_space(object) {
+                return self.lxr.common.immortal.trace_object(self, object);
+            }
             return object;
         }
+        let object = object.get_forwarded_object().unwrap_or(object);
         if self.lxr.rc.count(object) == 0 {
             return object;
         }
@@ -632,7 +654,6 @@ impl<VM: VMBinding, const FULL_GC: bool> LXRStopTheWorldProcessEdges<VM, FULL_GC
             object,
             self.remset_recorded_slots
         );
-        let object = object.get_forwarded_object().unwrap_or(object);
         let new_object = if self.lxr.immix_space.in_space(object) {
             if self
                 .lxr
@@ -816,8 +837,17 @@ impl<VM: VMBinding> ProcessEdgesWork for LXRWeakRefProcessEdges<VM> {
                 true,
                 worker,
             )
-        } else {
+        } else if self.lxr.los().in_space(object) {
             self.lxr.los().trace_object(self, object)
+        } else {
+            #[cfg(feature = "vm_space")]
+            if self.lxr.common.base.vm_space.in_space(object) {
+                return self.lxr.common.base.vm_space.trace_object(self, object);
+            }
+            if self.lxr.common.immortal.in_space(object) {
+                return self.lxr.common.immortal.trace_object(self, object);
+            }
+            object
         }
     }
 

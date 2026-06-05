@@ -417,14 +417,14 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 }
                 if self.request_for_large {
                     self.set_large_allocating_block(block);
-                    self.large_bump_pointer.cursor = block.start();
+                    self.large_bump_pointer.cursor = block.start() + 16_usize;
                     self.large_bump_pointer.limit = block.end();
                 } else {
                     if cfg!(feature = "prefetch") {
                         crate::util::memory::prefetch(block.start(), Block::BYTES);
                     }
                     self.set_allocating_block(block);
-                    self.bump_pointer.cursor = block.start();
+                    self.bump_pointer.cursor = block.start() + 16_usize;
                     self.bump_pointer.limit = block.end();
                 }
                 self.alloc(size, align, offset)

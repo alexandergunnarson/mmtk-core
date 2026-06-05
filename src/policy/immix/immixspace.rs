@@ -373,6 +373,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 MetadataSpec::OnSide(Block::NURSERY_PROMOTION_STATE_TABLE),
                 MetadataSpec::OnSide(Block::PHASE_EPOCH),
                 MetadataSpec::OnSide(IX_LINE_REUSE_COUNT),
+                #[cfg(feature = "object_pinning")]
+                *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
             ];
             return metadata::extract_side_metadata(&meta);
         }

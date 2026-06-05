@@ -43,7 +43,15 @@ pub struct BumpPointer {
 impl BumpPointer {
     /// Reset the cursor and limit to the given values.
     pub fn reset(&mut self, start: Address, end: Address) {
-        self.cursor = start;
+        // Safe Headroom Guard: Ensure the cursor always starts at least 16 bytes
+        // after any block/chunk boundary to prevent 16-byte GenericMemory headers
+        // from straddling into unmapped memory at the start of blocks/chunks!
+        // (SOTA SFT / page safety under MMTk).
+        if !start.is_zero() {
+            self.cursor = start + 16_usize;
+        } else {
+            self.cursor = start;
+        }
         self.limit = end;
     }
 }

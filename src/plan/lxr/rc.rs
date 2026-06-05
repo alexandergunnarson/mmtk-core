@@ -96,7 +96,7 @@ static RC_TRACE_COUNT: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
 /// observe the full inc/promote/dec/death pattern of the undercounted class.
 /// Set via `MMTK_RC_TRACE_VTAG` env var during `mmtk_gc_init`.
 #[cfg(feature = "lxr_rc_trace")]
-static RC_TRACE_VTAG: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
+pub(crate) static RC_TRACE_VTAG: RcTraceAtomicUsize = RcTraceAtomicUsize::new(0);
 
 /// GC cycle counter for trace log timestamps.
 #[cfg(feature = "lxr_rc_trace")]
@@ -1058,6 +1058,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     fn dont_evacuate(&self, o: ObjectReference, los: bool) -> bool {
         if los {
+            return true;
+        }
+        #[cfg(feature = "object_pinning")]
+        if VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.is_object_pinned::<VM>(o) {
             return true;
         }
         // Safety check: Never evacuate/forward non-heap/static/system-image objects!
