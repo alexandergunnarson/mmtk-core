@@ -467,6 +467,11 @@ pub trait Scanning<VM: VMBinding> {
         false
     }
 
+    /// Return whether the object is a valid heap object reference.
+    fn is_valid_object(_object: ObjectReference) -> bool {
+        true
+    }
+
     /// Forward weak references.
     ///
     /// This function will only be called in the forwarding stage when using the mark-compact GC

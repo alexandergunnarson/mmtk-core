@@ -926,6 +926,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 let Some(target) = slot.load() else {
                     return;
                 };
+                if !VM::VMScanning::is_valid_object(target) {
+                    return;
+                }
                 // Misclassification guard (lxr_rc_trace): a value/isbits array
                 // scanned as a pointer array will feed data words (Float bits,
                 // BitSet masks, poison) here as ObjectReferences.  Detect that
@@ -1060,8 +1063,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if los {
             return true;
         }
-        // Safety check: Never evacuate/forward non-heap/static/system-image objects!
-        if !crate::memory_manager::is_in_mmtk_spaces(o) {
+        if !self.lxr.immix_space.in_space(o) {
             return true;
         }
         #[cfg(feature = "object_pinning")]
@@ -1246,7 +1248,12 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             );
         }
         let o = match self.unlog_and_load_rc_object::<K>(s) {
-            Some(o) => o,
+            Some(o) => {
+                if !VM::VMScanning::is_valid_object(o) {
+                    return None;
+                }
+                o
+            }
             _ => {
                 return None;
             }
