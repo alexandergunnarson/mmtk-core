@@ -196,6 +196,18 @@ impl Slot for SimpleSlot {
     fn store(&self, object: ObjectReference) {
         unsafe { (*self.slot_addr).store(object.to_raw_address(), atomic::Ordering::Relaxed) }
     }
+
+    fn to_address(&self) -> Address {
+        self.as_address()
+    }
+
+    fn raw_address(&self) -> Address {
+        self.as_address()
+    }
+
+    fn from_address(addr: Address) -> Self {
+        SimpleSlot::from_address(addr)
+    }
 }
 
 /// For backword compatibility, we let `Address` implement `Slot` with the same semantics as
